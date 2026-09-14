@@ -16,7 +16,7 @@ on:
         default: '64,128,256,512'
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: bayes-2048-analytic-voc
@@ -24,6 +24,7 @@ concurrency:
 
 jobs:
   analytic-voc:
+    if: github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[analytic-voc-generated]')
     runs-on: [self-hosted, linux, x64, mercy-bench]
     env:
       RUSTFLAGS: -C target-cpu=native
@@ -31,6 +32,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Toolchain info
         run: |
@@ -39,8 +42,26 @@ jobs:
           uname -a
           lscpu
 
-      - name: Test analytic VOC
-        run: cargo test --release
+      - name: Materialize analytic VOC implementation
+        run: python scripts/apply_analytic_voc.py
+
+      - name: Format and test
+        run: |
+          cargo fmt --all
+          cargo test --release
+
+      - name: Commit generated implementation to feature branch
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Cargo.toml Cargo.lock README.md plot.py src/main.rs
+          if ! git diff --cached --quiet; then
+            git commit -m 'Implement analytic VOC [analytic-voc-generated]'
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
 
       - name: Run analytic VOC sweep
         shell: bash
