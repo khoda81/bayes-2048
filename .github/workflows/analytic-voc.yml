@@ -23,24 +23,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  analytic-voc:
+  prepare:
     if: github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[analytic-voc-generated]')
-    runs-on: [self-hosted, linux, x64, mercy-bench]
-    env:
-      RUSTFLAGS: -C target-cpu=native
-      CARGO_TERM_COLOR: never
-
+    runs-on: ubuntu-latest
+    outputs:
+      prepared_sha: ${{ steps.commit.outputs.sha }}
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - name: Toolchain info
+      - name: Install Rust stable
         run: |
-          rustc --version --verbose
-          cargo --version
-          uname -a
-          lscpu
+          rustup update stable --no-self-update
+          rustup default stable
 
       - name: Materialize analytic VOC implementation
         run: python scripts/apply_analytic_voc.py
@@ -50,8 +46,8 @@ jobs:
           cargo fmt --all
           cargo test --release
 
-      - name: Commit generated implementation to feature branch
-        if: github.event_name == 'push'
+      - name: Commit implementation to feature branch
+        id: commit
         shell: bash
         run: |
           set -euo pipefail
@@ -62,6 +58,25 @@ jobs:
             git commit -m 'Implement analytic VOC [analytic-voc-generated]'
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  benchmark:
+    needs: prepare
+    runs-on: [self-hosted, linux, x64, mercy-bench]
+    env:
+      RUSTFLAGS: -C target-cpu=native
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.prepared_sha }}
+
+      - name: Toolchain info
+        run: |
+          rustc --version --verbose
+          cargo --version
+          uname -a
+          lscpu
 
       - name: Run analytic VOC sweep
         shell: bash
@@ -69,7 +84,7 @@ jobs:
           set -euo pipefail
           GAMES="${{ github.event.inputs.games || '100' }}"
           BUDGETS="${{ github.event.inputs.budgets || '64,128,256,512' }}"
-          cargo run --release -- \
+          cargo run --release --locked -- \
             --games "$GAMES" \
             --budgets "$BUDGETS" \
             --policies exact-voc \
