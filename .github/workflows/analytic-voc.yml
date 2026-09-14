@@ -1,0 +1,65 @@
+name: Analytic VOC experiment
+
+on:
+  push:
+    branches:
+      - 'feat/**'
+  workflow_dispatch:
+    inputs:
+      games:
+        description: 'Games per budget'
+        required: false
+        default: '100'
+      budgets:
+        description: 'Comma-separated simulations per move'
+        required: false
+        default: '64,128,256,512'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bayes-2048-analytic-voc
+  cancel-in-progress: true
+
+jobs:
+  analytic-voc:
+    runs-on: [self-hosted, linux, x64, mercy-bench]
+    env:
+      RUSTFLAGS: -C target-cpu=native
+      CARGO_TERM_COLOR: never
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Toolchain info
+        run: |
+          rustc --version --verbose
+          cargo --version
+          uname -a
+          lscpu
+
+      - name: Test analytic VOC
+        run: cargo test --release
+
+      - name: Run analytic VOC sweep
+        shell: bash
+        run: |
+          set -euo pipefail
+          GAMES="${{ github.event.inputs.games || '100' }}"
+          BUDGETS="${{ github.event.inputs.budgets || '64,128,256,512' }}"
+          cargo run --release -- \
+            --games "$GAMES" \
+            --budgets "$BUDGETS" \
+            --policies exact-voc \
+            --log-every 25 \
+            --out results-exact
+
+      - name: Upload analytic VOC results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bayes-2048-analytic-voc-results
+          path: results-exact/games.csv
+          if-no-files-found: warn
+          retention-days: 30
