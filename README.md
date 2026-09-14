@@ -6,6 +6,7 @@ Policies:
 
 - `uct`: scale-free UCT. Returns are empirically normalized at each node, then the canonical UCB1 bonus is used.
 - `thompson`: Student-t Thompson sampling under the Jeffreys normal model `p(mu,sigma) ∝ 1/sigma`.
+- `exact-voc`: analytic **one-step expected reduction in Bayes simple regret** under the Student-t posterior predictive; no MC sample-count parameter.
 - `mc-voc-N`: Monte-Carlo estimate of **one-step expected reduction in Bayes simple regret** using `N` posterior-predictive samples.
 
 The game engine uses standard 2048 rules: tile-2 probability 0.9, tile-4 probability 0.1, and the true merge score as reward.
@@ -62,3 +63,33 @@ After three observations, this gives Student-t posterior and posterior-predictiv
 `E_y[max_j E[mu_j | D, y_i]] - max_j E[mu_j | D]`.
 
 This is the myopic value of computation for terminal simple regret. The MC noise is intentionally retained after clamping negative estimates to zero, matching the X-O experiment where estimator noise appeared to rescue some zero-VOC dead zones.
+
+
+## Analytic VOC experiment
+
+For edge statistics `(n, mu, s)`, one additional observation makes the updated
+posterior mean
+
+```text
+mu' = mu + tau * T_nu
+nu  = n - 1
+tau = s / sqrt(n(n+1))
+```
+
+so for best competing posterior mean `c`,
+
+```text
+VOC = E[(mu' - c)+] - (mu - c)+.
+```
+
+The Student-t positive-part expectation has a closed form, so `exact-voc`
+requires no inner Monte-Carlo estimator and remains positive-affine reward
+invariant.
+
+```bash
+cargo run --release -- \
+  --games 100 \
+  --budgets 64,128,256,512 \
+  --policies exact-voc \
+  --out results-exact
+```

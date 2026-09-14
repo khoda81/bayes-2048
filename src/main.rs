@@ -1,16 +1,17 @@
 use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle};
 use rand::prelude::*;
 use rand::rngs::SmallRng;
 use rand_distr::{Distribution, StudentT};
 use rayon::prelude::*;
-use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
+use statrs::distribution::{Continuous, ContinuousCDF, StudentsT};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const DIRS: [Dir; 4] = [Dir::Up, Dir::Down, Dir::Left, Dir::Right];
@@ -64,8 +65,18 @@ impl Board {
 
         for line_idx in 0..4 {
             let idxs = match dir {
-                Dir::Left => [line_idx * 4, line_idx * 4 + 1, line_idx * 4 + 2, line_idx * 4 + 3],
-                Dir::Right => [line_idx * 4 + 3, line_idx * 4 + 2, line_idx * 4 + 1, line_idx * 4],
+                Dir::Left => [
+                    line_idx * 4,
+                    line_idx * 4 + 1,
+                    line_idx * 4 + 2,
+                    line_idx * 4 + 3,
+                ],
+                Dir::Right => [
+                    line_idx * 4 + 3,
+                    line_idx * 4 + 2,
+                    line_idx * 4 + 1,
+                    line_idx * 4,
+                ],
                 Dir::Up => [line_idx, line_idx + 4, line_idx + 8, line_idx + 12],
                 Dir::Down => [line_idx + 12, line_idx + 8, line_idx + 4, line_idx],
             };
@@ -89,7 +100,10 @@ impl Board {
     }
 
     fn spawn<R: Rng + ?Sized>(mut self, rng: &mut R) -> Self {
-        let empties: Vec<usize> = self.0.iter().enumerate()
+        let empties: Vec<usize> = self
+            .0
+            .iter()
+            .enumerate()
             .filter_map(|(i, &x)| (x == 0).then_some(i))
             .collect();
         if empties.is_empty() {
@@ -163,7 +177,11 @@ impl Stats {
     }
 
     fn sd(&self) -> f64 {
-        if self.n < 2 { 0.0 } else { (self.m2 / (self.n - 1) as f64).max(0.0).sqrt() }
+        if self.n < 2 {
+            0.0
+        } else {
+            (self.m2 / (self.n - 1) as f64).max(0.0).sqrt()
+        }
     }
 }
 
@@ -195,10 +213,16 @@ struct Node {
 
 impl Node {
     fn new(board: Board) -> Self {
-        let edges = board.legal_moves().into_iter()
+        let edges = board
+            .legal_moves()
+            .into_iter()
             .map(|(d, b, r)| Edge::new(d, b, r))
             .collect();
-        Self { board, visits: 0, edges }
+        Self {
+            board,
+            visits: 0,
+            edges,
+        }
     }
 
     fn terminal(&self) -> bool {
@@ -210,6 +234,7 @@ impl Node {
 enum Policy {
     Uct,
     Thompson,
+    ExactVoc,
     McVoc(usize),
 }
 
@@ -221,18 +246,28 @@ impl Policy {
         if s == "thompson" {
             return Ok(Self::Thompson);
         }
+        if s == "exact-voc" {
+            return Ok(Self::ExactVoc);
+        }
         if let Some(rest) = s.strip_prefix("mc-voc-") {
-            let n: usize = rest.parse().map_err(|_| format!("bad MC sample count in {s}"))?;
-            if n == 0 { return Err(format!("MC sample count must be >0 in {s}")); }
+            let n: usize = rest
+                .parse()
+                .map_err(|_| format!("bad MC sample count in {s}"))?;
+            if n == 0 {
+                return Err(format!("MC sample count must be >0 in {s}"));
+            }
             return Ok(Self::McVoc(n));
         }
-        Err(format!("unknown policy {s}; use uct, thompson, mc-voc-N"))
+        Err(format!(
+            "unknown policy {s}; use uct, thompson, exact-voc, mc-voc-N"
+        ))
     }
 
     fn name(self) -> String {
         match self {
             Self::Uct => "uct".into(),
             Self::Thompson => "thompson".into(),
+            Self::ExactVoc => "exact-voc".into(),
             Self::McVoc(n) => format!("mc-voc-{n}"),
         }
     }
@@ -257,7 +292,9 @@ struct SearchCfg {
 }
 
 fn sample_student_t<R: Rng + ?Sized>(rng: &mut R, df: f64) -> f64 {
-    StudentT::new(df).expect("positive degrees of freedom").sample(rng)
+    StudentT::new(df)
+        .expect("positive degrees of freedom")
+        .sample(rng)
 }
 
 fn posterior_mean_sample<R: Rng + ?Sized>(s: Stats, rng: &mut R) -> f64 {
@@ -279,6 +316,41 @@ fn predictive_sample<R: Rng + ?Sized>(s: Stats, rng: &mut R) -> f64 {
     s.mean + s.sd() * (1.0 + 1.0 / s.n as f64).sqrt() * t
 }
 
+fn exact_voc(stats: Stats, other_best: f64) -> f64 {
+    // Under Jeffreys' p(mu,sigma) ∝ 1/sigma, after n observations the next
+    // posterior mean is mu' = mu + tau*T_nu with nu=n-1 and
+    // tau=sd/sqrt(n(n+1)). For c=best competing posterior mean,
+    // VOC = E[(mu'-c)_+] - (mu-c)_+.
+    if stats.n < 3 {
+        return 0.0;
+    }
+    let sd = stats.sd();
+    if !(sd > 0.0) || !sd.is_finite() {
+        return 0.0;
+    }
+
+    let n = stats.n as f64;
+    let nu = n - 1.0;
+    let tau = sd / (n * (n + 1.0)).sqrt();
+    if !(tau > 0.0) || !tau.is_finite() {
+        return 0.0;
+    }
+
+    let z = (other_best - stats.mean) / tau;
+    let t = StudentsT::new(0.0, 1.0, nu).expect("valid Student-t parameters");
+    let pdf = t.pdf(z);
+    let leading = ((nu + z * z) / (nu - 1.0)) * pdf;
+
+    // Equivalent stable forms of
+    // tau * [((nu+z^2)/(nu-1))*f(z) - z*(1-F(z))] - (mu-c)_+.
+    let voc = if z >= 0.0 {
+        tau * (leading - z * t.sf(z))
+    } else {
+        tau * (leading + z * t.cdf(z))
+    };
+    voc.max(0.0)
+}
+
 fn least_sampled(edges: &[Edge]) -> usize {
     let min_n = edges.iter().map(|e| e.stats.n).min().unwrap_or(0);
     edges.iter().position(|e| e.stats.n == min_n).unwrap()
@@ -293,15 +365,27 @@ fn select_edge<R: Rng + ?Sized>(node: &Node, cfg: &SearchCfg, rng: &mut R) -> us
             }
             // Scale-free UCT: normalize each empirical mean using the observed
             // return range at this node, then use the canonical UCB1 bonus.
-            let lo = node.edges.iter().map(|e| e.stats.min).fold(f64::INFINITY, f64::min);
-            let hi = node.edges.iter().map(|e| e.stats.max).fold(f64::NEG_INFINITY, f64::max);
+            let lo = node
+                .edges
+                .iter()
+                .map(|e| e.stats.min)
+                .fold(f64::INFINITY, f64::min);
+            let hi = node
+                .edges
+                .iter()
+                .map(|e| e.stats.max)
+                .fold(f64::NEG_INFINITY, f64::max);
             let range = hi - lo;
             let log_n = (node.visits.max(1) as f64).ln();
 
             let mut best_i = 0;
             let mut best = f64::NEG_INFINITY;
             for (i, e) in node.edges.iter().enumerate() {
-                let q = if range > 0.0 { (e.stats.mean - lo) / range } else { 0.5 };
+                let q = if range > 0.0 {
+                    (e.stats.mean - lo) / range
+                } else {
+                    0.5
+                };
                 let bonus = (2.0 * log_n / e.stats.n as f64).sqrt();
                 let score = q + bonus;
                 if score > best {
@@ -327,6 +411,31 @@ fn select_edge<R: Rng + ?Sized>(node: &Node, cfg: &SearchCfg, rng: &mut R) -> us
             }
             best_i
         }
+        Policy::ExactVoc => {
+            if node.edges.iter().any(|e| e.stats.n < 3) {
+                return least_sampled(&node.edges);
+            }
+
+            let means: Vec<f64> = node.edges.iter().map(|e| e.stats.mean).collect();
+            let mut scores = vec![0.0; node.edges.len()];
+            for (i, e) in node.edges.iter().enumerate() {
+                let other_best = means
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(j, &x)| (j != i).then_some(x))
+                    .fold(f64::NEG_INFINITY, f64::max);
+                scores[i] = exact_voc(e.stats, other_best);
+            }
+
+            let max_score = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let eps = 1e-12 * (1.0 + max_score.abs());
+            let ties: Vec<usize> = scores
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &x)| ((x - max_score).abs() <= eps).then_some(i))
+                .collect();
+            ties[rng.random_range(0..ties.len())]
+        }
         Policy::McVoc(mc) => {
             // Same finite-mean requirement as Thompson.
             if node.edges.iter().any(|e| e.stats.n < 3) {
@@ -337,7 +446,9 @@ fn select_edge<R: Rng + ?Sized>(node: &Node, cfg: &SearchCfg, rng: &mut R) -> us
             let mut scores = vec![0.0; node.edges.len()];
 
             for (i, e) in node.edges.iter().enumerate() {
-                let other_best = means.iter().enumerate()
+                let other_best = means
+                    .iter()
+                    .enumerate()
                     .filter_map(|(j, &x)| (j != i).then_some(x))
                     .fold(f64::NEG_INFINITY, f64::max);
 
@@ -354,7 +465,9 @@ fn select_edge<R: Rng + ?Sized>(node: &Node, cfg: &SearchCfg, rng: &mut R) -> us
             }
 
             let max_score = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let ties: Vec<usize> = scores.iter().enumerate()
+            let ties: Vec<usize> = scores
+                .iter()
+                .enumerate()
                 .filter_map(|(i, &x)| ((x - max_score).abs() <= 1e-12).then_some(i))
                 .collect();
             ties[rng.random_range(0..ties.len())]
@@ -362,11 +475,7 @@ fn select_edge<R: Rng + ?Sized>(node: &Node, cfg: &SearchCfg, rng: &mut R) -> us
     }
 }
 
-fn random_rollout<R: Rng + ?Sized>(
-    mut board: Board,
-    rng: &mut R,
-    cap: usize,
-) -> u64 {
+fn random_rollout<R: Rng + ?Sized>(mut board: Board, rng: &mut R, cap: usize) -> u64 {
     let mut score = 0u64;
     for _ in 0..cap {
         let legal = board.legal_moves();
@@ -380,11 +489,7 @@ fn random_rollout<R: Rng + ?Sized>(
     score
 }
 
-fn simulate<R: Rng + ?Sized>(
-    node: &mut Node,
-    cfg: &SearchCfg,
-    rng: &mut R,
-) -> u64 {
+fn simulate<R: Rng + ?Sized>(node: &mut Node, cfg: &SearchCfg, rng: &mut R) -> u64 {
     if node.terminal() {
         return 0;
     }
@@ -429,7 +534,8 @@ fn choose_move<R: Rng + ?Sized>(
     }
 
     // Terminal Bayes action: maximize posterior expected return.
-    root.edges.iter()
+    root.edges
+        .iter()
         .max_by(|a, b| a.stats.mean.total_cmp(&b.stats.mean))
         .map(|e| e.dir)
 }
@@ -474,9 +580,8 @@ fn play_game(
     loop {
         // Deterministic per-(game, move) search seed. This also makes the
         // affine-reward invariance test meaningful.
-        let search_seed = seed
-            ^ (moves as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            ^ 0xD1B5_4A32_D192_ED03;
+        let search_seed =
+            seed ^ (moves as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
         let mut search_rng = SmallRng::seed_from_u64(search_seed);
 
         let Some(dir) = choose_move(board, simulations, &cfg, &mut search_rng) else {
@@ -497,7 +602,10 @@ fn play_game(
         seed,
         policy: policy.name(),
         simulations,
-        mc_samples: match policy { Policy::McVoc(n) => n, _ => 0 },
+        mc_samples: match policy {
+            Policy::McVoc(n) => n,
+            _ => 0,
+        },
         final_score: score,
         max_tile: board.max_tile(),
         moves,
@@ -519,7 +627,7 @@ struct Args {
     #[arg(long, default_value = "8,16,32,64,128")]
     budgets: String,
 
-    /// Comma-separated policies: uct, thompson, mc-voc-N.
+    /// Comma-separated policies: uct, thompson, exact-voc, mc-voc-N.
     #[arg(long, default_value = "uct,thompson,mc-voc-8,mc-voc-32,mc-voc-128")]
     policies: String,
 
@@ -556,14 +664,20 @@ struct Args {
 
 fn parse_usizes(s: &str) -> Result<Vec<usize>, String> {
     s.split(',')
-        .map(|x| x.trim().parse::<usize>().map_err(|_| format!("bad integer: {x}")))
+        .map(|x| {
+            x.trim()
+                .parse::<usize>()
+                .map_err(|_| format!("bad integer: {x}"))
+        })
         .collect()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let budgets = parse_usizes(&args.budgets)?;
-    let policies: Vec<Policy> = args.policies.split(',')
+    let policies: Vec<Policy> = args
+        .policies
+        .split(',')
         .map(|s| Policy::parse(s.trim()))
         .collect::<Result<_, _>>()?;
 
@@ -599,19 +713,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let games = args.games;
     let base_seed = args.seed;
-    let all_jobs: Vec<(u64, Policy, usize)> = budgets.iter().flat_map(|&budget| {
-        policies.iter().flat_map(move |&policy| {
-            (0..games).map(move |g| {
-                let seed = base_seed.wrapping_add(g as u64);
-                (seed, policy, budget)
+    let all_jobs: Vec<(u64, Policy, usize)> = budgets
+        .iter()
+        .flat_map(|&budget| {
+            policies.iter().flat_map(move |&policy| {
+                (0..games).map(move |g| {
+                    let seed = base_seed.wrapping_add(g as u64);
+                    (seed, policy, budget)
+                })
             })
         })
-    }).collect();
+        .collect();
 
-    let mut jobs: Vec<(u64, Policy, usize)> = all_jobs.into_iter()
-        .filter(|(seed, policy, budget)| {
-            !completed_keys.contains(&(*seed, policy.name(), *budget))
-        })
+    let mut jobs: Vec<(u64, Policy, usize)> = all_jobs
+        .into_iter()
+        .filter(|(seed, policy, budget)| !completed_keys.contains(&(*seed, policy.name(), *budget)))
         .collect();
 
     // Mix cheap/expensive budgets and policies so the measured throughput and
@@ -638,15 +754,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     pb.set_style(
         ProgressStyle::with_template(
             "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] \
-             {pos}/{len} ({percent}%) ETA {eta_precise} | {per_sec} | {msg}"
+             {pos}/{len} ({percent}%) ETA {eta_precise} | {per_sec} | {msg}",
         )?
-        .progress_chars("=>-")
+        .progress_chars("=>-"),
     );
     pb.set_message("starting…");
 
     eprintln!(
         "running {} pending games / {} total ({} policies × {} budgets × {} seeds) on {} threads",
-        jobs.len(), total_requested, policies.len(), budgets.len(), args.games,
+        jobs.len(),
+        total_requested,
+        policies.len(),
+        budgets.len(),
+        args.games,
         rayon::current_num_threads()
     );
 
@@ -728,39 +848,48 @@ mod tests {
 
     #[test]
     fn merge_once_per_tile() {
-        assert_eq!(merge_line([1,1,1,1]), ([2,2,0,0], 8));
-        assert_eq!(merge_line([1,1,2,0]), ([2,2,0,0], 4));
-        assert_eq!(merge_line([2,2,2,0]), ([3,2,0,0], 8));
-        assert_eq!(merge_line([1,0,1,1]), ([2,1,0,0], 4));
+        assert_eq!(merge_line([1, 1, 1, 1]), ([2, 2, 0, 0], 8));
+        assert_eq!(merge_line([1, 1, 2, 0]), ([2, 2, 0, 0], 4));
+        assert_eq!(merge_line([2, 2, 2, 0]), ([3, 2, 0, 0], 8));
+        assert_eq!(merge_line([1, 0, 1, 1]), ([2, 1, 0, 0], 4));
     }
 
     #[test]
     fn left_move_score() {
-        let b = Board([
-            1,1,0,0,
-            2,2,2,2,
-            0,0,0,0,
-            1,0,1,0,
-        ]);
+        let b = Board([1, 1, 0, 0, 2, 2, 2, 2, 0, 0, 0, 0, 1, 0, 1, 0]);
         let (m, r) = b.moved(Dir::Left).unwrap();
         assert_eq!(r, 4 + 8 + 8 + 4);
-        assert_eq!(m.0, [
-            2,0,0,0,
-            3,3,0,0,
-            0,0,0,0,
-            2,0,0,0,
-        ]);
+        assert_eq!(m.0, [2, 0, 0, 0, 3, 3, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0,]);
     }
 
     #[test]
     fn no_move_is_none() {
-        let b = Board([
-            1,2,3,4,
-            2,3,4,5,
-            3,4,5,6,
-            4,5,6,7,
-        ]);
+        let b = Board([1, 2, 3, 4, 2, 3, 4, 5, 3, 4, 5, 6, 4, 5, 6, 7]);
         assert!(b.legal_moves().is_empty());
+    }
+
+    #[test]
+    fn exact_voc_is_positive_at_decision_boundary() {
+        let mut s = Stats::default();
+        for x in [1.0, 2.0, 3.0, 4.0] {
+            s.observe(x);
+        }
+        assert!(exact_voc(s, s.mean) > 0.0);
+    }
+
+    #[test]
+    fn exact_voc_is_affine_equivariant() {
+        let xs = [100.0, 300.0, 200.0, 500.0, 250.0];
+        let mut a = Stats::default();
+        let mut b = Stats::default();
+        for x in xs {
+            a.observe(x);
+            b.observe(1000.0 * x + 37.0);
+        }
+        let va = exact_voc(a, 280.0);
+        let vb = exact_voc(b, 1000.0 * 280.0 + 37.0);
+        let rel = (vb - 1000.0 * va).abs() / (1.0 + vb.abs());
+        assert!(rel < 1e-10, "va={va} vb={vb} rel={rel}");
     }
 
     #[test]
@@ -770,9 +899,9 @@ mod tests {
         let mut b = Stats::default();
         for x in xs {
             a.observe(x);
-            b.observe(1000.0*x + 37.0);
+            b.observe(1000.0 * x + 37.0);
         }
-        assert!((b.mean - (1000.0*a.mean + 37.0)).abs() < 1e-8);
-        assert!((b.sd() - 1000.0*a.sd()).abs() < 1e-8);
+        assert!((b.mean - (1000.0 * a.mean + 37.0)).abs() < 1e-8);
+        assert!((b.sd() - 1000.0 * a.sd()).abs() < 1e-8);
     }
 }
