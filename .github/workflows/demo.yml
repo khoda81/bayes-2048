@@ -1,0 +1,94 @@
+name: Exact VOC replay
+
+on:
+  push:
+    branches:
+      - 'feat/analytic-voc'
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: 'Game seed'
+        required: false
+        default: '46'
+      budget:
+        description: 'Simulations per move'
+        required: false
+        default: '512'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bayes-2048-exact-voc-replay
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    if: github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[demo-generated]')
+    runs-on: ubuntu-latest
+    outputs:
+      prepared_sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust stable
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+
+      - name: Add trace mode
+        run: python scripts/apply_demo_trace.py
+
+      - name: Format and test
+        run: |
+          cargo fmt --all
+          cargo test --release
+
+      - name: Commit trace mode
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Cargo.toml Cargo.lock src/main.rs scripts/apply_demo_trace.py
+          if ! git diff --cached --quiet; then
+            git commit -m 'Add exact-VOC trace mode [analytic-voc-generated] [demo-generated]'
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  replay:
+    needs: prepare
+    runs-on: [self-hosted, linux, x64, mercy-bench]
+    env:
+      RUSTFLAGS: -C target-cpu=native
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.prepared_sha }}
+
+      - name: Generate representative exact-VOC trace
+        shell: bash
+        run: |
+          set -euo pipefail
+          SEED="${{ github.event.inputs.seed || '46' }}"
+          BUDGET="${{ github.event.inputs.budget || '512' }}"
+          cargo run --release --locked -- \
+            --games 1 \
+            --budgets "$BUDGET" \
+            --policies exact-voc \
+            --seed "$SEED" \
+            --trace-json exact-voc-replay.json \
+            --out replay-unused
+
+      - name: Upload replay trace
+        uses: actions/upload-artifact@v7
+        with:
+          name: bayes-2048-exact-voc-replay
+          path: exact-voc-replay.json
+          if-no-files-found: error
+          retention-days: 30
