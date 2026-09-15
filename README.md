@@ -45,7 +45,19 @@ The dashboard refreshes during each search. Its `before` board is the current
 game state, while `after` is the provisional posterior-mean-best move before
 the random tile spawn. Tiles use exponent symbols (`1` = 2, `2` = 4, ...,
 `a` = 1024). Dashboard formatting and terminal I/O are excluded from the
-reported search-compute time; deadline checks happen between simulations.
+reported search-compute time; deadline checks happen between simulations. In a
+terminal, live play uses the alternate screen and restores the original screen,
+cursor, wrapping, and input mode on exit.
+
+Live controls:
+
+- `Space` or `Enter`: act immediately using the current posterior-mean best.
+- Arrow key: immediately force that direction when it is legal.
+- `i`: toggle between unlimited thinking and the most recent finite budget.
+- `+` / `-` (or Page Up / Page Down): adjust the current time budget by 50 ms,
+  or a fixed-simulation budget by 128 simulations.
+- `[` / `]`: decrease/increase the refresh interval by 10 ms.
+- `q`, Escape, or Ctrl-C: quit and restore the original terminal screen.
 
 Add `--trace-json trace.json` to retain the game and final root diagnostics for
 every move. Fixed-simulation single-game play remains available with, for

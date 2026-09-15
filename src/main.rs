@@ -1,4 +1,11 @@
 use clap::Parser;
+use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{
+    Clear, ClearType, DisableLineWrap, EnableLineWrap, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode,
+};
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::prelude::*;
 use rand::rngs::SmallRng;
@@ -9,7 +16,7 @@ use statrs::distribution::{Continuous, ContinuousCDF, StudentsT};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write as IoWrite};
+use std::io::{self, IsTerminal, Write as IoWrite};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -257,7 +264,7 @@ impl Policy {
                 .parse()
                 .map_err(|_| format!("bad MC sample count in {s}"))?;
             if n == 0 {
-                return Err(format!("MC sample count must be >0 in {s}"));
+                return Err(format!("MC sample count must be positive in {s}"));
             }
             return Ok(Self::McVoc(n));
         }
@@ -302,7 +309,7 @@ fn sample_student_t<R: Rng + ?Sized>(rng: &mut R, df: f64) -> f64 {
 
 fn posterior_mean_sample<R: Rng + ?Sized>(s: Stats, rng: &mut R) -> f64 {
     // Jeffreys normal model p(mu,sigma) ∝ 1/sigma.
-    // With n>=3, mu | data is Student-t(df=n-1, loc=xbar, scale=sd/sqrt(n)).
+    // With 3 <= n, mu | data is Student-t(df=n-1, loc=xbar, scale=sd/sqrt(n)).
     if s.n < 3 || s.sd() == 0.0 {
         return s.mean;
     }
@@ -438,7 +445,7 @@ fn select_edge<R: Rng + ?Sized>(node: &Node, cfg: &SearchCfg, rng: &mut R) -> us
             best_i
         }
         Policy::Thompson => {
-            // The Jeffreys normal posterior has a finite posterior mean once n>=3.
+            // The Jeffreys normal posterior has a finite posterior mean once 3 <= n.
             if node.edges.iter().any(|e| e.stats.n < 3) {
                 return least_sampled(&node.edges);
             }
@@ -607,6 +614,9 @@ struct TraceStep {
     search_wall_ms: f64,
     search_overhead_ms: f64,
     search_simulations: u32,
+    search_budget_ms: Option<f64>,
+    search_budget_simulations: Option<usize>,
+    search_unlimited: bool,
     spawn_index: usize,
     spawn_tile: u64,
     board_after: [u64; 16],
@@ -773,26 +783,247 @@ fn write_compact_board(output: &mut String, board: Board) -> fmt::Result {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SearchBudget {
     Simulations(usize),
     Time(Duration),
+    Unlimited,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct LiveSearch {
-    frame_interval: Duration,
     move_index: usize,
     score: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveCommand {
+    Continue,
+    ActBest,
+    Force(Dir),
+    Quit,
+}
+
+struct LiveTerminal {
+    alternate_screen: bool,
+}
+
+impl LiveTerminal {
+    fn enter() -> io::Result<Self> {
+        let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+        if !interactive {
+            return Ok(Self {
+                alternate_screen: false,
+            });
+        }
+
+        enable_raw_mode()?;
+        let mut stdout = io::stdout().lock();
+        if let Err(error) = execute!(stdout, EnterAlternateScreen, Hide, DisableLineWrap) {
+            let _ = disable_raw_mode();
+            return Err(error);
+        }
+        Ok(Self {
+            alternate_screen: true,
+        })
+    }
+
+    fn interactive(&self) -> bool {
+        self.alternate_screen
+    }
+
+    fn draw(&self, frame: &str) -> io::Result<()> {
+        let mut stdout = io::stdout().lock();
+        if self.alternate_screen {
+            execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
+            // Raw mode disables newline translation, so emit CRLF explicitly.
+            stdout.write_all(frame.replace('\n', "\r\n").as_bytes())?;
+        } else {
+            stdout.write_all(b"\x1b[2J\x1b[H")?;
+            stdout.write_all(frame.as_bytes())?;
+        }
+        stdout.flush()
+    }
+}
+
+impl Drop for LiveTerminal {
+    fn drop(&mut self) {
+        if !self.alternate_screen {
+            return;
+        }
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout().lock();
+        let _ = execute!(stdout, LeaveAlternateScreen, Show, EnableLineWrap);
+        let _ = stdout.flush();
+    }
+}
+
+struct LiveSession {
+    terminal: LiveTerminal,
+    budget: SearchBudget,
+    last_limited_budget: SearchBudget,
+    frame_interval: Duration,
+    notice: String,
+    revision: u64,
+}
+
+impl LiveSession {
+    const TIME_STEP: Duration = Duration::from_millis(50);
+    const MIN_TIME: Duration = Duration::from_millis(10);
+    const SIMULATION_STEP: usize = 128;
+    const FRAME_STEP: Duration = Duration::from_millis(10);
+    const MIN_FRAME: Duration = Duration::from_millis(10);
+
+    fn new(budget: SearchBudget, frame_interval: Duration) -> io::Result<Self> {
+        debug_assert!(!matches!(budget, SearchBudget::Unlimited));
+        Ok(Self {
+            terminal: LiveTerminal::enter()?,
+            budget,
+            last_limited_budget: budget,
+            frame_interval,
+            notice: "searching".into(),
+            revision: 0,
+        })
+    }
+
+    fn interactive(&self) -> bool {
+        self.terminal.interactive()
+    }
+
+    fn set_notice(&mut self, notice: impl Into<String>) {
+        self.notice = notice.into();
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    fn toggle_unlimited(&mut self) {
+        if matches!(self.budget, SearchBudget::Unlimited) {
+            self.budget = self.last_limited_budget;
+            self.set_notice(format!("restored {}", describe_budget(self.budget)));
+        } else {
+            self.last_limited_budget = self.budget;
+            self.budget = SearchBudget::Unlimited;
+            self.set_notice("timeout disabled; press space to act");
+        }
+    }
+
+    fn adjust_budget(&mut self, increase: bool) {
+        let base = if matches!(self.budget, SearchBudget::Unlimited) {
+            self.last_limited_budget
+        } else {
+            self.budget
+        };
+        let adjusted = match base {
+            SearchBudget::Time(duration) if increase => {
+                SearchBudget::Time(duration.saturating_add(Self::TIME_STEP))
+            }
+            SearchBudget::Time(duration) => {
+                SearchBudget::Time(duration.saturating_sub(Self::TIME_STEP).max(Self::MIN_TIME))
+            }
+            SearchBudget::Simulations(count) if increase => {
+                SearchBudget::Simulations(count.saturating_add(Self::SIMULATION_STEP))
+            }
+            SearchBudget::Simulations(count) => {
+                SearchBudget::Simulations(count.saturating_sub(Self::SIMULATION_STEP).max(1))
+            }
+            SearchBudget::Unlimited => unreachable!("unlimited uses last_limited_budget"),
+        };
+        self.budget = adjusted;
+        self.last_limited_budget = adjusted;
+        self.set_notice(format!("budget changed to {}", describe_budget(adjusted)));
+    }
+
+    fn adjust_frame_interval(&mut self, increase: bool) {
+        self.frame_interval = if increase {
+            self.frame_interval.saturating_add(Self::FRAME_STEP)
+        } else {
+            self.frame_interval
+                .saturating_sub(Self::FRAME_STEP)
+                .max(Self::MIN_FRAME)
+        };
+        self.set_notice(format!(
+            "refresh interval {:.0} ms",
+            self.frame_interval.as_secs_f64() * 1000.0
+        ));
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> LiveCommand {
+        if matches!(key.kind, KeyEventKind::Release) {
+            return LiveCommand::Continue;
+        }
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return LiveCommand::Quit;
+        }
+
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => LiveCommand::Quit,
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                self.set_notice("acting now with current best");
+                LiveCommand::ActBest
+            }
+            KeyCode::Up => LiveCommand::Force(Dir::Up),
+            KeyCode::Down => LiveCommand::Force(Dir::Down),
+            KeyCode::Left => LiveCommand::Force(Dir::Left),
+            KeyCode::Right => LiveCommand::Force(Dir::Right),
+            KeyCode::Char('i') => {
+                self.toggle_unlimited();
+                LiveCommand::Continue
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::PageUp => {
+                self.adjust_budget(true);
+                LiveCommand::Continue
+            }
+            KeyCode::Char('-') | KeyCode::PageDown => {
+                self.adjust_budget(false);
+                LiveCommand::Continue
+            }
+            KeyCode::Char('[') => {
+                self.adjust_frame_interval(false);
+                LiveCommand::Continue
+            }
+            KeyCode::Char(']') => {
+                self.adjust_frame_interval(true);
+                LiveCommand::Continue
+            }
+            _ => LiveCommand::Continue,
+        }
+    }
+
+    fn poll_command(&mut self) -> io::Result<LiveCommand> {
+        while event::poll(Duration::ZERO)? {
+            if let Event::Key(key) = event::read()? {
+                let command = self.handle_key(key);
+                if command != LiveCommand::Continue {
+                    return Ok(command);
+                }
+            }
+        }
+        Ok(LiveCommand::Continue)
+    }
+}
+
+fn describe_budget(budget: SearchBudget) -> String {
+    match budget {
+        SearchBudget::Time(duration) => {
+            format!("{:.0} ms", duration.as_secs_f64() * 1000.0)
+        }
+        SearchBudget::Simulations(count) => format!("{count} simulations"),
+        SearchBudget::Unlimited => "unlimited thinking".into(),
+    }
 }
 
 struct SearchOutcome {
     dir: Dir,
     root: RootSnapshot,
+    budget: SearchBudget,
     simulations: u32,
     compute_elapsed: Duration,
     wall_elapsed: Duration,
     excluded_overhead: Duration,
+}
+
+struct LiveSearchRuntime<'a> {
+    session: &'a mut LiveSession,
+    context: LiveSearch,
 }
 
 fn progress_bar(fraction: f64) -> String {
@@ -806,7 +1037,7 @@ fn render_search_frame(
     snapshot: &RootSnapshot,
     policy: Policy,
     live: LiveSearch,
-    budget: SearchBudget,
+    session: &LiveSession,
     compute_elapsed: Duration,
 ) -> io::Result<()> {
     let compute_seconds = compute_elapsed.as_secs_f64();
@@ -835,7 +1066,7 @@ fn render_search_frame(
     )
     .expect("writing to String cannot fail");
 
-    match budget {
+    match session.budget {
         SearchBudget::Time(duration) => {
             let fraction = compute_seconds / duration.as_secs_f64();
             writeln!(
@@ -864,6 +1095,16 @@ fn render_search_frame(
             )
             .expect("writing to String cannot fail");
         }
+        SearchBudget::Unlimited => {
+            writeln!(
+                output,
+                "think {:>8.1} ms [       unlimited        ] | {:>7} sims | {:>8.0} sims/s",
+                compute_seconds * 1000.0,
+                snapshot.total_samples,
+                sims_per_second,
+            )
+            .expect("writing to String cannot fail");
+        }
     }
 
     writeln!(
@@ -876,6 +1117,7 @@ fn render_search_frame(
         max_voc,
     )
     .expect("writing to String cannot fail");
+    writeln!(output, "status {}", session.notice).expect("writing to String cannot fail");
 
     writeln!(output, "\nbefore:").expect("writing to String cannot fail");
     write_compact_board(&mut output, board).expect("writing to String cannot fail");
@@ -926,11 +1168,13 @@ fn render_search_frame(
         "\n* posterior-mean best | switch = P(one sample flips this arm vs its competitor)"
     )
     .expect("writing to String cannot fail");
+    writeln!(
+        output,
+        "keys: space/enter act | arrows force | +/- budget | i infinite | [/] refresh | q quit"
+    )
+    .expect("writing to String cannot fail");
 
-    let mut stdout = io::stdout().lock();
-    stdout.write_all(b"\x1b[2J\x1b[H")?;
-    stdout.write_all(output.as_bytes())?;
-    stdout.flush()
+    session.terminal.draw(&output)
 }
 
 fn search_move_with_diagnostics<R: Rng + ?Sized>(
@@ -938,18 +1182,32 @@ fn search_move_with_diagnostics<R: Rng + ?Sized>(
     budget: SearchBudget,
     cfg: &SearchCfg,
     rng: &mut R,
-    live: Option<LiveSearch>,
+    mut live: Option<LiveSearchRuntime<'_>>,
 ) -> io::Result<Option<SearchOutcome>> {
+    const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
     let mut root = Node::new(board);
     if root.terminal() {
         return Ok(None);
     }
 
+    if let Some(runtime) = live.as_mut() {
+        runtime.session.set_notice("searching");
+    }
+
     let wall_start = Instant::now();
     let mut excluded_overhead = Duration::ZERO;
     let mut sims_done = 0u32;
-    let mut next_frame = live.map(|display| display.frame_interval);
-    let mut last_rendered_simulations = None;
+    let mut active_budget = live
+        .as_ref()
+        .map_or(budget, |runtime| runtime.session.budget);
+    let mut next_frame = live.as_ref().map(|runtime| runtime.session.frame_interval);
+    let mut next_input_poll = live
+        .as_ref()
+        .filter(|runtime| runtime.session.interactive())
+        .map(|_| Duration::ZERO);
+    let mut last_rendered_state = None;
+    let mut selected_dir = None;
     let min_time_budget_sims = match cfg.policy {
         Policy::Uct => root.edges.len(),
         Policy::Thompson | Policy::ExactVoc | Policy::McVoc(_) => 3 * root.edges.len(),
@@ -957,11 +1215,50 @@ fn search_move_with_diagnostics<R: Rng + ?Sized>(
 
     loop {
         let compute_elapsed = wall_start.elapsed().saturating_sub(excluded_overhead);
-        let budget_exhausted = match budget {
+
+        if let Some(input_due) = next_input_poll
+            && input_due <= compute_elapsed
+        {
+            let input_start = Instant::now();
+            let runtime = live.as_mut().expect("input polling requires live mode");
+            let old_frame_interval = runtime.session.frame_interval;
+            let command = runtime.session.poll_command()?;
+            active_budget = runtime.session.budget;
+            if old_frame_interval != runtime.session.frame_interval {
+                next_frame = Some(compute_elapsed + runtime.session.frame_interval);
+            }
+            excluded_overhead += input_start.elapsed();
+
+            let mut following = input_due + INPUT_POLL_INTERVAL;
+            while following <= compute_elapsed {
+                following += INPUT_POLL_INTERVAL;
+            }
+            next_input_poll = Some(following);
+
+            match command {
+                LiveCommand::Continue => {}
+                LiveCommand::ActBest => break,
+                LiveCommand::Force(dir) => {
+                    if root.edges.iter().any(|edge| edge.dir == dir) {
+                        runtime.session.set_notice(format!("forcing {dir}"));
+                        selected_dir = Some(dir);
+                        break;
+                    }
+                    runtime
+                        .session
+                        .set_notice(format!("ignored: {dir} is illegal"));
+                }
+                LiveCommand::Quit => return Ok(None),
+            }
+        }
+
+        let compute_elapsed = wall_start.elapsed().saturating_sub(excluded_overhead);
+        let budget_exhausted = match active_budget {
             SearchBudget::Simulations(limit) => limit <= sims_done as usize,
             SearchBudget::Time(limit) => {
                 limit <= compute_elapsed && min_time_budget_sims <= sims_done
             }
+            SearchBudget::Unlimited => false,
         };
         if budget_exhausted {
             break;
@@ -971,27 +1268,28 @@ fn search_move_with_diagnostics<R: Rng + ?Sized>(
         sims_done += 1;
 
         let compute_elapsed = wall_start.elapsed().saturating_sub(excluded_overhead);
-        if let (Some(display), Some(frame_due)) = (live, next_frame)
+        if let Some(frame_due) = next_frame
             && frame_due <= compute_elapsed
         {
             let render_start = Instant::now();
             let snapshot = snapshot_root(&root);
+            let runtime = live.as_ref().expect("frame rendering requires live mode");
             render_search_frame(
                 board,
                 &snapshot,
                 cfg.policy,
-                display,
-                budget,
+                runtime.context,
+                runtime.session,
                 compute_elapsed,
             )?;
             excluded_overhead += render_start.elapsed();
-            last_rendered_simulations = Some(sims_done);
+            last_rendered_state = Some((sims_done, runtime.session.revision));
 
             // Schedule frames by search-compute time. If one simulation spans
             // several intervals, skip missed frames instead of emitting a burst.
-            let mut following = frame_due + display.frame_interval;
+            let mut following = frame_due + runtime.session.frame_interval;
             while following <= compute_elapsed {
-                following += display.frame_interval;
+                following += runtime.session.frame_interval;
             }
             next_frame = Some(following);
         }
@@ -1000,23 +1298,24 @@ fn search_move_with_diagnostics<R: Rng + ?Sized>(
     let compute_elapsed = wall_start.elapsed().saturating_sub(excluded_overhead);
     let final_frame_start = Instant::now();
     let snapshot = snapshot_root(&root);
-    if let Some(display) = live
-        && last_rendered_simulations != Some(sims_done)
+    if let Some(runtime) = live.as_ref()
+        && last_rendered_state != Some((sims_done, runtime.session.revision))
     {
         render_search_frame(
             board,
             &snapshot,
             cfg.policy,
-            display,
-            budget,
+            runtime.context,
+            runtime.session,
             compute_elapsed,
         )?;
         excluded_overhead += final_frame_start.elapsed();
     }
 
     Ok(Some(SearchOutcome {
-        dir: snapshot.best_dir,
+        dir: selected_dir.unwrap_or(snapshot.best_dir),
         root: snapshot,
+        budget: active_budget,
         simulations: sims_done,
         compute_elapsed,
         wall_elapsed: wall_start.elapsed(),
@@ -1041,16 +1340,18 @@ fn play_trace(
         rollout_cap,
         reward_transform: transform,
     };
+    let mut live_session = live_frame_interval
+        .map(|frame_interval| LiveSession::new(budget, frame_interval))
+        .transpose()?;
 
     loop {
         let move_index = moves.len();
         let search_seed =
             seed ^ (move_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
         let mut search_rng = SmallRng::seed_from_u64(search_seed);
-        let live = live_frame_interval.map(|frame_interval| LiveSearch {
-            frame_interval,
-            move_index,
-            score,
+        let live = live_session.as_mut().map(|session| LiveSearchRuntime {
+            session,
+            context: LiveSearch { move_index, score },
         });
         let Some(search) =
             search_move_with_diagnostics(board, budget, &cfg, &mut search_rng, live)?
@@ -1075,6 +1376,11 @@ fn play_trace(
             let e = spawned.0[spawn_index];
             if e == 0 { 0 } else { 1u64 << e }
         };
+        let (search_budget_ms, search_budget_simulations, search_unlimited) = match search.budget {
+            SearchBudget::Time(duration) => (Some(duration.as_secs_f64() * 1000.0), None, false),
+            SearchBudget::Simulations(count) => (None, Some(count), false),
+            SearchBudget::Unlimited => (None, None, true),
+        };
 
         moves.push(TraceStep {
             move_index,
@@ -1087,6 +1393,9 @@ fn play_trace(
             search_wall_ms: search.wall_elapsed.as_secs_f64() * 1000.0,
             search_overhead_ms: search.excluded_overhead.as_secs_f64() * 1000.0,
             search_simulations: search.simulations,
+            search_budget_ms,
+            search_budget_simulations,
+            search_unlimited,
             spawn_index,
             spawn_tile,
             board_after: board_values(spawned),
@@ -1103,6 +1412,7 @@ fn play_trace(
     let (simulations, time_ms) = match budget {
         SearchBudget::Simulations(count) => (Some(count), None),
         SearchBudget::Time(duration) => (None, Some(duration.as_secs_f64() * 1000.0)),
+        SearchBudget::Unlimited => unreachable!("CLI budget is always limited"),
     };
     Ok(GameTrace {
         seed,
@@ -1281,7 +1591,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Result<_, _>>()?;
 
     if !args.reward_scale.is_finite() || args.reward_scale <= 0.0 {
-        return Err("--reward-scale must be finite and > 0".into());
+        return Err("--reward-scale must be finite and positive".into());
     }
     if !args.reward_shift.is_finite() {
         return Err("--reward-shift must be finite".into());
@@ -1302,11 +1612,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("--play/--trace-json requires exactly one --policies entry".into());
         }
         if !args.frame_ms.is_finite() || args.frame_ms <= 0.0 {
-            return Err("--frame-ms must be finite and > 0".into());
+            return Err("--frame-ms must be finite and positive".into());
         }
         if let Some(ms) = args.time_ms {
             if !ms.is_finite() || ms <= 0.0 {
-                return Err("--time-ms must be finite and > 0".into());
+                return Err("--time-ms must be finite and positive".into());
             }
         } else if budgets.len() != 1 {
             return Err(
@@ -1656,5 +1966,66 @@ mod tests {
         assert_eq!(benchmark_choice, Some(diagnostic.dir));
         assert_eq!(diagnostic.simulations, 64);
         assert_eq!(diagnostic.root.total_samples, 64);
+    }
+
+    #[test]
+    fn live_budget_controls_toggle_and_adjust() {
+        let initial = SearchBudget::Time(Duration::from_millis(300));
+        let mut session = LiveSession {
+            terminal: LiveTerminal {
+                alternate_screen: false,
+            },
+            budget: initial,
+            last_limited_budget: initial,
+            frame_interval: Duration::from_millis(50),
+            notice: String::new(),
+            revision: 0,
+        };
+
+        assert_eq!(
+            session.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),
+            LiveCommand::Continue
+        );
+        assert_eq!(session.budget, SearchBudget::Unlimited);
+
+        session.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+        assert_eq!(
+            session.budget,
+            SearchBudget::Time(Duration::from_millis(350))
+        );
+        session.handle_key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE));
+        assert_eq!(session.budget, initial);
+
+        session.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        assert_eq!(session.frame_interval, Duration::from_millis(40));
+        session.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+        assert_eq!(session.frame_interval, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn live_action_and_quit_keys_map_to_commands() {
+        let mut session = LiveSession {
+            terminal: LiveTerminal {
+                alternate_screen: false,
+            },
+            budget: SearchBudget::Simulations(512),
+            last_limited_budget: SearchBudget::Simulations(512),
+            frame_interval: Duration::from_millis(50),
+            notice: String::new(),
+            revision: 0,
+        };
+
+        assert_eq!(
+            session.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            LiveCommand::ActBest
+        );
+        assert_eq!(
+            session.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            LiveCommand::Force(Dir::Left)
+        );
+        assert_eq!(
+            session.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            LiveCommand::Quit
+        );
     }
 }
