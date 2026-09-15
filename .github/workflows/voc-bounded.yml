@@ -1,0 +1,130 @@
+name: VOC-bounded search pilot
+
+on:
+  push:
+    branches:
+      - 'feat/voc-bounded-search'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    if: github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[voc-bounded-generated]')
+    runs-on: ubuntu-latest
+    outputs:
+      prepared_sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Install Rust stable
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+      - name: Apply VOC-bounded search
+        run: python3 scripts/apply_voc_bounded.py
+      - name: Format and test
+        run: |
+          cargo fmt --all
+          cargo test --release --locked
+      - name: Smoke VOC stop
+        run: |
+          rm -f /tmp/voc-smoke.json
+          cargo run --release --locked -- \
+            --trace-json /tmp/voc-smoke.json \
+            --policies exact-voc \
+            --budgets 64 \
+            --voc-cost 1 \
+            --seed 1
+          test -s /tmp/voc-smoke.json
+          grep -q 'search_stopped_by_voc' /tmp/voc-smoke.json
+      - name: Commit generated implementation
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/main.rs scripts/apply_voc_bounded.py
+          if ! git diff --cached --quiet; then
+            git commit -m 'Add VOC-bounded root search [voc-bounded-generated] [analytic-voc-generated]'
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  pilot:
+    needs: prepare
+    if: needs.prepare.result == 'success'
+    runs-on: [self-hosted, linux, x64, mercy-bench]
+    env:
+      RUSTFLAGS: -C target-cpu=native
+      CARGO_TERM_COLOR: never
+      RAYON_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.prepared_sha }}
+      - name: Build
+        run: cargo build --release --locked
+      - name: Run matched pilot sweep
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$PWD/target/release/bayes-2048"
+          OUT="$PWD/voc-bounded-pilot"
+          mkdir -p "$OUT/traces" "$OUT/fixed"
+          echo 'mode,param,seed,final_score,max_tile,moves,total_sims,total_search_ms,voc_stops' > "$OUT/runs.csv"
+
+          # Fixed-simulation reference points on the same seeds.
+          for budget in 16 32 64 128 256 512; do
+            for seed in 1 2 3 4; do
+              dir="$OUT/fixed/b${budget}-s${seed}"
+              mkdir -p "$dir"
+              "$BIN" --games 1 --budgets "$budget" --policies exact-voc --seed "$seed" --out "$dir" --log-every 1 >/dev/null 2>&1
+              row=$(tail -n 1 "$dir/games.csv")
+              IFS=, read -r _ _ _ _ score tile moves wall_ms _ _ _ <<< "$row"
+              total_sims=$((budget * moves))
+              printf 'fixed,%s,%s,%s,%s,%s,%s,%s,0\n' "$budget" "$seed" "$score" "$tile" "$moves" "$total_sims" "$wall_ms" >> "$OUT/runs.csv"
+            done
+          done
+
+          # VOC prices are score units per root simulation. B=512 is only a cap.
+          for cost in 0 0.01 0.1 1 10 100; do
+            for seed in 1 2 3 4; do
+              trace="$OUT/traces/c${cost}-s${seed}.json"
+              "$BIN" --trace-json "$trace" --policies exact-voc --budgets 512 --voc-cost "$cost" --seed "$seed" >/dev/null 2>&1
+              score=$(awk '/"final_score":/ {gsub(/[, ]/,"",$2); print $2; exit}' "$trace")
+              tile=$(awk '/"max_tile":/ {gsub(/[, ]/,"",$2); print $2; exit}' "$trace")
+              moves=$(grep -c '"move_index":' "$trace" || true)
+              total_sims=$(awk '/"search_simulations":/ {gsub(/,/,"",$2); s += $2} END {printf "%.0f", s+0}' "$trace")
+              total_ms=$(awk '/"search_ms":/ {gsub(/,/,"",$2); s += $2} END {printf "%.6f", s+0}' "$trace")
+              voc_stops=$(grep -c '"search_stopped_by_voc": true' "$trace" || true)
+              printf 'voc,%s,%s,%s,%s,%s,%s,%s,%s\n' "$cost" "$seed" "$score" "$tile" "$moves" "$total_sims" "$total_ms" "$voc_stops" >> "$OUT/runs.csv"
+            done
+          done
+
+          awk -F, '
+            BEGIN { print "mode,param,n,mean_score,mean_moves,mean_sims_per_move,mean_search_ms_per_move,voc_stop_fraction" }
+            NR > 1 {
+              key=$1 SUBSEP $2; n[key]++; score[key]+=$4; moves[key]+=$6; sims[key]+=$7; ms[key]+=$8; stops[key]+=$9
+            }
+            END {
+              for (key in n) {
+                split(key,p,SUBSEP)
+                printf "%s,%s,%d,%.3f,%.3f,%.3f,%.6f,%.6f\n", p[1],p[2],n[key],score[key]/n[key],moves[key]/n[key],sims[key]/moves[key],ms[key]/moves[key],stops[key]/moves[key]
+              }
+            }
+          ' "$OUT/runs.csv" | sort -t, -k1,1 -k2,2n > "$OUT/summary-body.csv"
+          echo 'mode,param,n,mean_score,mean_moves,mean_sims_per_move,mean_search_ms_per_move,voc_stop_fraction' > "$OUT/summary.csv"
+          tail -n +2 "$OUT/summary-body.csv" >> "$OUT/summary.csv"
+          rm "$OUT/summary-body.csv"
+          cat "$OUT/summary.csv"
+      - name: Upload pilot results
+        uses: actions/upload-artifact@v7
+        with:
+          name: bayes-2048-voc-bounded-pilot
+          path: voc-bounded-pilot
+          if-no-files-found: error
+          retention-days: 30
