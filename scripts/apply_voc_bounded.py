@@ -246,10 +246,23 @@ replace_once(
         )?;
 ''')
 
-# Ensure all direct test call sites to the diagnostic search get the new arg.
-s = s.replace(
-    'search_move_with_diagnostics(board, budget, &cfg, &mut rng, None)',
-    'search_move_with_diagnostics(board, budget, &cfg, &mut rng, None, None)',
-)
+replace_once(
+'''        let diagnostic = search_move_with_diagnostics(
+            board,
+            SearchBudget::Simulations(64),
+            &cfg,
+            &mut diagnostic_rng,
+            None,
+        )
+''',
+'''        let diagnostic = search_move_with_diagnostics(
+            board,
+            SearchBudget::Simulations(64),
+            &cfg,
+            &mut diagnostic_rng,
+            None,
+            None,
+        )
+''')
 
 path.write_text(s)
