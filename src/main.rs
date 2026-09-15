@@ -540,6 +540,162 @@ fn choose_move<R: Rng + ?Sized>(
         .map(|e| e.dir)
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ActionTrace {
+    dir: String,
+    samples: u32,
+    mean: f64,
+    voc: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TraceStep {
+    move_index: usize,
+    score_before: u64,
+    score_after: u64,
+    board_before: [u64; 16],
+    chosen: String,
+    reward: u64,
+    spawn_index: usize,
+    spawn_tile: u64,
+    board_after: [u64; 16],
+    actions: Vec<ActionTrace>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GameTrace {
+    seed: u64,
+    policy: String,
+    simulations: usize,
+    final_score: u64,
+    max_tile: u64,
+    moves: Vec<TraceStep>,
+}
+
+fn board_values(board: Board) -> [u64; 16] {
+    std::array::from_fn(|i| {
+        let e = board.0[i];
+        if e == 0 { 0 } else { 1u64 << e }
+    })
+}
+
+fn choose_move_with_trace<R: Rng + ?Sized>(
+    board: Board,
+    simulations: usize,
+    cfg: &SearchCfg,
+    rng: &mut R,
+) -> Option<(Dir, Vec<ActionTrace>)> {
+    let mut root = Node::new(board);
+    if root.terminal() {
+        return None;
+    }
+    for _ in 0..simulations {
+        simulate(&mut root, cfg, rng);
+    }
+
+    let means: Vec<f64> = root.edges.iter().map(|e| e.stats.mean).collect();
+    let actions = root
+        .edges
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let other_best = means
+                .iter()
+                .enumerate()
+                .filter_map(|(j, &x)| (j != i).then_some(x))
+                .fold(f64::NEG_INFINITY, f64::max);
+            let voc = match cfg.policy {
+                Policy::ExactVoc => exact_voc(e.stats, other_best),
+                _ => 0.0,
+            };
+            ActionTrace {
+                dir: e.dir.to_string(),
+                samples: e.stats.n,
+                mean: e.stats.mean,
+                voc,
+            }
+        })
+        .collect();
+
+    let dir = root
+        .edges
+        .iter()
+        .max_by(|a, b| a.stats.mean.total_cmp(&b.stats.mean))?
+        .dir;
+    Some((dir, actions))
+}
+
+fn play_trace(
+    seed: u64,
+    policy: Policy,
+    simulations: usize,
+    rollout_cap: usize,
+    transform: RewardTransform,
+) -> GameTrace {
+    let mut env_rng = SmallRng::seed_from_u64(seed);
+    let mut board = Board::initial(&mut env_rng);
+    let mut score = 0u64;
+    let mut moves = Vec::new();
+    let cfg = SearchCfg {
+        policy,
+        rollout_cap,
+        reward_transform: transform,
+    };
+
+    loop {
+        let move_index = moves.len();
+        let search_seed =
+            seed ^ (move_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
+        let mut search_rng = SmallRng::seed_from_u64(search_seed);
+        let Some((dir, actions)) =
+            choose_move_with_trace(board, simulations, &cfg, &mut search_rng)
+        else {
+            break;
+        };
+        let Some((moved, reward)) = board.moved(dir) else {
+            break;
+        };
+
+        let before = board;
+        let score_before = score;
+        score += reward;
+        let spawned = moved.spawn(&mut env_rng);
+        let spawn_index = moved
+            .0
+            .iter()
+            .zip(spawned.0.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
+        let spawn_tile = {
+            let e = spawned.0[spawn_index];
+            if e == 0 { 0 } else { 1u64 << e }
+        };
+
+        moves.push(TraceStep {
+            move_index,
+            score_before,
+            score_after: score,
+            board_before: board_values(before),
+            chosen: dir.to_string(),
+            reward,
+            spawn_index,
+            spawn_tile,
+            board_after: board_values(spawned),
+            actions,
+        });
+        board = spawned;
+    }
+
+    GameTrace {
+        seed,
+        policy: policy.name(),
+        simulations,
+        final_score: score,
+        max_tile: board.max_tile(),
+        moves,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GameRow {
     seed: u64,
@@ -648,6 +804,11 @@ struct Args {
     #[arg(long, default_value_t = 0.0)]
     reward_shift: f64,
 
+    /// Write one traced game as JSON instead of running the benchmark.
+    /// Requires exactly one policy and one budget.
+    #[arg(long)]
+    trace_json: Option<PathBuf>,
+
     /// Output directory.
     #[arg(long, default_value = "results")]
     out: PathBuf,
@@ -693,6 +854,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         scale: args.reward_scale,
         shift: args.reward_shift,
     };
+
+    if let Some(trace_path) = &args.trace_json {
+        if policies.len() != 1 || budgets.len() != 1 {
+            return Err(
+                "--trace-json requires exactly one --policies entry and one --budgets entry".into(),
+            );
+        }
+        if let Some(parent) = trace_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let trace = play_trace(
+            args.seed,
+            policies[0],
+            budgets[0],
+            args.rollout_cap,
+            transform,
+        );
+        fs::write(trace_path, serde_json::to_string_pretty(&trace)?)?;
+        eprintln!(
+            "trace: seed={} policy={} B={} score={} tile={} moves={} -> {}",
+            trace.seed,
+            trace.policy,
+            trace.simulations,
+            trace.final_score,
+            trace.max_tile,
+            trace.moves.len(),
+            trace_path.display()
+        );
+        return Ok(());
+    }
 
     let path = args.out.join("games.csv");
 

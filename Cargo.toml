@@ -12,3 +12,4 @@ rand_distr = "0.5"
 rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 statrs = "0.18"
+serde_json = "1.0"
