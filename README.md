@@ -28,6 +28,29 @@ Then:
 uv run --with pandas --with matplotlib plot.py results/games.csv
 ```
 
+## Live play
+
+Run one game with a wall-clock search-compute budget per move:
+
+```bash
+cargo run --release -- \
+  --play \
+  --policies exact-voc \
+  --time-ms 300 \
+  --frame-ms 50 \
+  --seed 46
+```
+
+The dashboard refreshes during each search. Its `before` board is the current
+game state, while `after` is the provisional posterior-mean-best move before
+the random tile spawn. Tiles use exponent symbols (`1` = 2, `2` = 4, ...,
+`a` = 1024). Dashboard formatting and terminal I/O are excluded from the
+reported search-compute time; deadline checks happen between simulations.
+
+Add `--trace-json trace.json` to retain the game and final root diagnostics for
+every move. Fixed-simulation single-game play remains available with, for
+example, `--play --budgets 512 --policies exact-voc`.
+
 For a larger run:
 
 ```bash
