@@ -28,10 +28,10 @@ jobs:
       - name: Apply inline-edge refactor
         run: python3 scripts/apply_inline_edges.py
 
-      - name: Format and test
+      - name: Format, refresh lockfile, and test
         run: |
           cargo fmt --all
-          cargo test --release --locked
+          cargo test --release
 
       - name: Commit generated inline implementation
         id: commit
@@ -102,7 +102,6 @@ jobs:
             tail -n 1 "$dir/games.csv"
           }
 
-          # Warm both code paths.
           run_one warm-arena "$BASE" 64 uct 999 >/dev/null
           run_one warm-inline "$INLINE" 64 uct 999 >/dev/null
 
@@ -110,7 +109,6 @@ jobs:
           for budget in 128 512; do
             for policy in uct exact-voc; do
               for seed in 1 2 3 4 5 6; do
-                # Alternate execution order to reduce systematic thermal/frequency bias.
                 if (( seed % 2 == 0 )); then
                   arow=$(run_one arena "$BASE" "$budget" "$policy" "$seed")
                   irow=$(run_one inline "$INLINE" "$budget" "$policy" "$seed")
