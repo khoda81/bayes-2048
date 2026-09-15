@@ -1,0 +1,77 @@
+name: Search constraints refactor
+
+on:
+  push:
+    branches:
+      - 'feat/search-constraints'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    if: github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[constraints-generated]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Install Rust stable
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+      - name: Apply search constraint refactor
+        run: python3 scripts/apply_search_constraints.py
+      - name: Format and test
+        run: |
+          cargo fmt --all
+          cargo test --release --locked
+      - name: Smoke VOC-only constraint
+        run: |
+          rm -f /tmp/voc-only.json
+          cargo run --release --locked -- \
+            --trace-json /tmp/voc-only.json \
+            --policies exact-voc \
+            --voc-cost 1 \
+            --seed 1
+          test -s /tmp/voc-only.json
+          grep -q '"voc_cost": 1.0' /tmp/voc-only.json
+          grep -q '"simulations": null' /tmp/voc-only.json
+          grep -q '"time_ms": null' /tmp/voc-only.json
+      - name: Smoke all constraints together
+        run: |
+          rm -f /tmp/all-constraints.json
+          cargo run --release --locked -- \
+            --trace-json /tmp/all-constraints.json \
+            --policies exact-voc \
+            --simulation-limit 64 \
+            --time-ms 1000 \
+            --voc-cost 0 \
+            --seed 2
+          test -s /tmp/all-constraints.json
+          grep -q '"simulations": 64' /tmp/all-constraints.json
+          grep -q '"time_ms": 1000.0' /tmp/all-constraints.json
+          grep -q '"voc_cost": 0.0' /tmp/all-constraints.json
+          grep -q '"search_budget_simulations": 64' /tmp/all-constraints.json
+          grep -q '"search_budget_ms": 1000.0' /tmp/all-constraints.json
+      - name: Smoke legacy single budget alias
+        run: |
+          rm -f /tmp/legacy-budget.json
+          cargo run --release --locked -- \
+            --trace-json /tmp/legacy-budget.json \
+            --policies exact-voc \
+            --budgets 32 \
+            --seed 3
+          grep -q '"simulations": 32' /tmp/legacy-budget.json
+      - name: Commit generated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/main.rs
+          if ! git diff --cached --quiet; then
+            git commit -m 'Refactor search into composable constraints [constraints-generated] [voc-bounded-generated]'
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
