@@ -26,7 +26,7 @@ jobs:
           rustup default stable
 
       - name: Apply arena refactor
-        run: python scripts/apply_arena_tree.py
+        run: python3 scripts/apply_arena_tree.py
 
       - name: Format and test
         run: |
@@ -80,7 +80,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python arena/scripts/bench_arena.py \
+          python3 arena/scripts/bench_arena.py \
             baseline/target/release/bayes-2048 \
             arena/target/release/bayes-2048 \
             arena-benchmark
