@@ -22,7 +22,10 @@ jobs:
           rustup update stable --no-self-update
           rustup default stable
       - name: Apply search constraint refactor
-        run: python3 scripts/apply_search_constraints.py
+        run: |
+          if ! grep -q 'struct SearchConstraints' src/main.rs; then
+            python3 scripts/apply_search_constraints.py
+          fi
       - name: Apply independent constraint TUI
         run: python3 scripts/apply_constraint_tui.py
       - name: Format and test
