@@ -1,0 +1,83 @@
+name: Child map statistics
+
+on:
+  push:
+    branches:
+      - 'feat/child-map-stats'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    if: github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[child-stats-generated]')
+    runs-on: ubuntu-latest
+    outputs:
+      prepared_sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Install Rust stable
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+      - name: Apply instrumentation
+        run: python3 scripts/apply_child_map_stats.py
+      - name: Format and test
+        run: |
+          cargo fmt --all
+          cargo test --release --locked
+      - name: Commit generated instrumentation
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/main.rs scripts/apply_child_map_stats.py
+          if ! git diff --cached --quiet; then
+            git commit -m 'Instrument child maps [child-stats-generated]'
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  measure:
+    needs: prepare
+    if: needs.prepare.result == 'success'
+    runs-on: [self-hosted, linux, x64, mercy-bench]
+    env:
+      RUSTFLAGS: -C target-cpu=native
+      CARGO_TERM_COLOR: never
+      RAYON_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.prepared_sha }}
+      - name: Build
+        run: cargo build --release --locked
+      - name: Measure child-map size distribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p child-map-stats results-child-stats
+          export BAYES2048_CHILD_STATS="$PWD/child-map-stats/raw.csv"
+          ./target/release/bayes-2048 \
+            --games 3 \
+            --budgets 128,512 \
+            --policies uct,exact-voc \
+            --seed 1 \
+            --out results-child-stats \
+            --log-every 1
+          wc -l "$BAYES2048_CHILD_STATS"
+          du -h "$BAYES2048_CHILD_STATS"
+      - name: Upload child-map stats
+        uses: actions/upload-artifact@v7
+        with:
+          name: bayes-2048-child-map-stats
+          path: |
+            child-map-stats/raw.csv
+            results-child-stats/games.csv
+          if-no-files-found: error
+          retention-days: 30
