@@ -1,0 +1,177 @@
+name: Inline edge benchmark
+
+on:
+  push:
+    branches:
+      - 'feat/inline-edges'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    if: github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[inline-generated]')
+    runs-on: ubuntu-latest
+    outputs:
+      prepared_sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust stable
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+
+      - name: Apply inline-edge refactor
+        run: python3 scripts/apply_inline_edges.py
+
+      - name: Format and test
+        run: |
+          cargo fmt --all
+          cargo test --release --locked
+
+      - name: Commit generated inline implementation
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/main.rs Cargo.toml Cargo.lock scripts/apply_inline_edges.py
+          if ! git diff --cached --quiet; then
+            git commit -m 'Inline MCTS edges [inline-generated]'
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  benchmark:
+    needs: prepare
+    if: needs.prepare.result == 'success'
+    runs-on: [self-hosted, linux, x64, mercy-bench]
+    env:
+      RUSTFLAGS: -C target-cpu=native
+      CARGO_TERM_COLOR: never
+      RAYON_NUM_THREADS: '1'
+    steps:
+      - name: Checkout inline implementation
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.prepared_sha }}
+          path: inline
+
+      - name: Checkout arena baseline
+        uses: actions/checkout@v5
+        with:
+          ref: 2e2be9bbb2fc07603ba1f4e8dc03dd4318b73428
+          path: arena
+
+      - name: Build arena baseline
+        working-directory: arena
+        run: cargo build --release --locked
+
+      - name: Build inline edges
+        working-directory: inline
+        run: cargo build --release --locked
+
+      - name: Paired deterministic benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="$PWD/arena/target/release/bayes-2048"
+          INLINE="$PWD/inline/target/release/bayes-2048"
+          OUT="$PWD/inline-edge-benchmark"
+          mkdir -p "$OUT/runs"
+          echo 'budget,policy,seed,arena_wall_ms,inline_wall_ms,speedup,arena_sims_per_second,inline_sims_per_second,final_score,max_tile,moves,semantic_match' > "$OUT/pairs.csv"
+
+          run_one() {
+            local impl="$1" bin="$2" budget="$3" policy="$4" seed="$5"
+            local dir="$OUT/runs/${impl}-${policy}-b${budget}-s${seed}"
+            rm -rf "$dir"
+            mkdir -p "$dir"
+            "$bin" \
+              --games 1 \
+              --budgets "$budget" \
+              --policies "$policy" \
+              --seed "$seed" \
+              --out "$dir" \
+              --log-every 1 \
+              >/dev/null 2>&1
+            tail -n 1 "$dir/games.csv"
+          }
+
+          # Warm both code paths.
+          run_one warm-arena "$BASE" 64 uct 999 >/dev/null
+          run_one warm-inline "$INLINE" 64 uct 999 >/dev/null
+
+          mismatch=0
+          for budget in 128 512; do
+            for policy in uct exact-voc; do
+              for seed in 1 2 3 4 5 6; do
+                # Alternate execution order to reduce systematic thermal/frequency bias.
+                if (( seed % 2 == 0 )); then
+                  arow=$(run_one arena "$BASE" "$budget" "$policy" "$seed")
+                  irow=$(run_one inline "$INLINE" "$budget" "$policy" "$seed")
+                else
+                  irow=$(run_one inline "$INLINE" "$budget" "$policy" "$seed")
+                  arow=$(run_one arena "$BASE" "$budget" "$policy" "$seed")
+                fi
+
+                IFS=, read -r _ _ _ _ ascore atile amoves ams asps _ _ <<< "$arow"
+                IFS=, read -r _ _ _ _ iscore itile imoves ims isps _ _ <<< "$irow"
+
+                match=true
+                if [[ "$ascore" != "$iscore" || "$atile" != "$itile" || "$amoves" != "$imoves" ]]; then
+                  match=false
+                  mismatch=1
+                fi
+                speedup=$(awk -v a="$ams" -v i="$ims" 'BEGIN { printf "%.9f", a/i }')
+                printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+                  "$budget" "$policy" "$seed" "$ams" "$ims" "$speedup" \
+                  "$asps" "$isps" "$iscore" "$itile" "$imoves" "$match" \
+                  >> "$OUT/pairs.csv"
+                printf 'B=%3s %-9s seed=%s: %7.3fs -> %7.3fs  speedup=%6.3fx  match=%s\n' \
+                  "$budget" "$policy" "$seed" \
+                  "$(awk -v x="$ams" 'BEGIN{print x/1000}')" \
+                  "$(awk -v x="$ims" 'BEGIN{print x/1000}')" \
+                  "$speedup" "$match"
+              done
+            done
+          done
+
+          awk -F, '
+            BEGIN { print "budget,policy,n,arena_total_s,inline_total_s,aggregate_speedup,mean_pair_speedup,all_semantic_match" }
+            NR > 1 {
+              key=$1 SUBSEP $2
+              n[key]++
+              a[key]+=$4
+              i[key]+=$5
+              sp[key]+=$6
+              if ($12 != "true") bad[key]=1
+            }
+            END {
+              for (key in n) {
+                split(key, p, SUBSEP)
+                printf "%s,%s,%d,%.9f,%.9f,%.9f,%.9f,%s\n", p[1], p[2], n[key], a[key]/1000, i[key]/1000, a[key]/i[key], sp[key]/n[key], (bad[key] ? "false" : "true")
+              }
+            }
+          ' "$OUT/pairs.csv" | sort -t, -k1,1n -k2,2 > "$OUT/summary.tmp"
+          head -n 1 "$OUT/summary.tmp" > "$OUT/summary.csv"
+          tail -n +2 "$OUT/summary.tmp" >> "$OUT/summary.csv"
+          rm "$OUT/summary.tmp"
+          cat "$OUT/summary.csv"
+
+          if (( mismatch != 0 )); then
+            echo 'ERROR: inline-edge implementation changed deterministic game outcomes' >&2
+            exit 2
+          fi
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v7
+        with:
+          name: bayes-2048-inline-edge-benchmark
+          path: inline-edge-benchmark
+          if-no-files-found: error
+          retention-days: 30
