@@ -6,6 +6,7 @@ Policies:
 
 - `uct`: scale-free UCT. Returns are empirically normalized at each node, then the canonical UCB1 bonus is used.
 - `thompson`: Student-t Thompson sampling under the Jeffreys normal model `p(mu,sigma) ∝ 1/sigma`.
+- `exact-voc`: analytic **one-step expected reduction in Bayes simple regret** under the Student-t posterior predictive; no MC sample-count parameter.
 - `mc-voc-N`: Monte-Carlo estimate of **one-step expected reduction in Bayes simple regret** using `N` posterior-predictive samples.
 
 The game engine uses standard 2048 rules: tile-2 probability 0.9, tile-4 probability 0.1, and the true merge score as reward.
@@ -26,6 +27,41 @@ Then:
 ```bash
 uv run --with pandas --with matplotlib plot.py results/games.csv
 ```
+
+## Live play
+
+Run one game with a wall-clock search-compute budget per move:
+
+```bash
+cargo run --release -- \
+  --play \
+  --policies exact-voc \
+  --time-ms 300 \
+  --frame-ms 50 \
+  --seed 46
+```
+
+The dashboard refreshes during each search. Its `before` board is the current
+game state, while `after` is the provisional posterior-mean-best move before
+the random tile spawn. Tiles use exponent symbols (`1` = 2, `2` = 4, ...,
+`a` = 1024). Dashboard formatting and terminal I/O are excluded from the
+reported search-compute time; deadline checks happen between simulations. In a
+terminal, live play uses the alternate screen and restores the original screen,
+cursor, wrapping, and input mode on exit.
+
+Live controls:
+
+- `Space` or `Enter`: act immediately using the current posterior-mean best.
+- Arrow key: immediately force that direction when it is legal.
+- `i`: toggle between unlimited thinking and the most recent finite budget.
+- `+` / `-` (or Page Up / Page Down): adjust the current time budget by 50 ms,
+  or a fixed-simulation budget by 128 simulations.
+- `[` / `]`: decrease/increase the refresh interval by 10 ms.
+- `q`, Escape, or Ctrl-C: quit and restore the original terminal screen.
+
+Add `--trace-json trace.json` to retain the game and final root diagnostics for
+every move. Fixed-simulation single-game play remains available with, for
+example, `--play --budgets 512 --policies exact-voc`.
 
 For a larger run:
 
@@ -62,3 +98,33 @@ After three observations, this gives Student-t posterior and posterior-predictiv
 `E_y[max_j E[mu_j | D, y_i]] - max_j E[mu_j | D]`.
 
 This is the myopic value of computation for terminal simple regret. The MC noise is intentionally retained after clamping negative estimates to zero, matching the X-O experiment where estimator noise appeared to rescue some zero-VOC dead zones.
+
+
+## Analytic VOC experiment
+
+For edge statistics `(n, mu, s)`, one additional observation makes the updated
+posterior mean
+
+```text
+mu' = mu + tau * T_nu
+nu  = n - 1
+tau = s / sqrt(n(n+1))
+```
+
+so for best competing posterior mean `c`,
+
+```text
+VOC = E[(mu' - c)+] - (mu - c)+.
+```
+
+The Student-t positive-part expectation has a closed form, so `exact-voc`
+requires no inner Monte-Carlo estimator and remains positive-affine reward
+invariant.
+
+```bash
+cargo run --release -- \
+  --games 100 \
+  --budgets 64,128,256,512 \
+  --policies exact-voc \
+  --out results-exact
+```
