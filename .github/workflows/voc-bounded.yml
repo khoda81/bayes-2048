@@ -24,12 +24,16 @@ jobs:
           rustup update stable --no-self-update
           rustup default stable
       - name: Apply VOC-bounded search
-        run: python3 scripts/apply_voc_bounded.py
+        run: |
+          if ! grep -q 'search_stopped_by_voc' src/main.rs; then
+            python3 scripts/apply_voc_bounded.py
+          fi
+          python3 scripts/apply_voc_unlimited.py
       - name: Format and test
         run: |
           cargo fmt --all
           cargo test --release --locked
-      - name: Smoke VOC stop
+      - name: Smoke capped VOC stop
         run: |
           rm -f /tmp/voc-smoke.json
           cargo run --release --locked -- \
@@ -40,6 +44,17 @@ jobs:
             --seed 1
           test -s /tmp/voc-smoke.json
           grep -q 'search_stopped_by_voc' /tmp/voc-smoke.json
+      - name: Smoke uncapped VOC stop
+        run: |
+          rm -f /tmp/voc-unlimited-smoke.json
+          cargo run --release --locked -- \
+            --trace-json /tmp/voc-unlimited-smoke.json \
+            --policies exact-voc \
+            --voc-cost 1 \
+            --seed 1
+          test -s /tmp/voc-unlimited-smoke.json
+          grep -q '"search_unlimited": true' /tmp/voc-unlimited-smoke.json
+          grep -q '"search_stopped_by_voc": true' /tmp/voc-unlimited-smoke.json
       - name: Commit generated implementation
         id: commit
         shell: bash
@@ -47,16 +62,16 @@ jobs:
           set -euo pipefail
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src/main.rs scripts/apply_voc_bounded.py
+          git add src/main.rs scripts/apply_voc_bounded.py scripts/apply_voc_unlimited.py
           if ! git diff --cached --quiet; then
-            git commit -m 'Add VOC-bounded root search [voc-bounded-generated] [analytic-voc-generated]'
+            git commit -m 'Allow unbounded VOC-priced search [voc-bounded-generated] [analytic-voc-generated]'
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   pilot:
     needs: prepare
-    if: needs.prepare.result == 'success'
+    if: needs.prepare.result == 'success' && github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, linux, x64, mercy-bench]
     env:
       RUSTFLAGS: -C target-cpu=native
