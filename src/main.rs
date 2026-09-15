@@ -204,12 +204,14 @@ impl Stats {
     }
 }
 
+type NodeId = u32;
+
 struct Edge {
     dir: Dir,
     moved: Board,
     immediate_reward: u64,
     stats: Stats,
-    children: HashMap<Board, Box<Node>>,
+    children: HashMap<Board, NodeId>,
 }
 
 impl Edge {
@@ -226,7 +228,7 @@ impl Edge {
 
 struct Node {
     // Retained in the tree representation to keep the benchmark node layout
-    // unchanged; live root rendering receives its board explicitly.
+    // comparable; live root rendering receives its board explicitly.
     _board: Board,
     visits: u32,
     edges: Vec<Edge>,
@@ -248,6 +250,43 @@ impl Node {
 
     fn terminal(&self) -> bool {
         self.edges.is_empty()
+    }
+}
+
+/// Append-only per-move MCTS arena.
+///
+/// Node IDs are Vec indices, so Vec reallocation can move Node values without
+/// invalidating tree links. A simulation creates at most one node, making a
+/// fixed-simulation search easy to reserve exactly up front.
+struct Tree {
+    nodes: Vec<Node>,
+}
+
+impl Tree {
+    const ROOT: NodeId = 0;
+
+    fn with_capacity(root: Board, capacity: usize) -> Self {
+        let mut nodes = Vec::with_capacity(capacity.max(1));
+        nodes.push(Node::new(root));
+        Self { nodes }
+    }
+
+    fn node(&self, id: NodeId) -> &Node {
+        &self.nodes[id as usize]
+    }
+
+    fn node_mut(&mut self, id: NodeId) -> &mut Node {
+        &mut self.nodes[id as usize]
+    }
+
+    fn alloc(&mut self, node: Node) -> NodeId {
+        let index = self.nodes.len();
+        assert!(
+            index <= NodeId::MAX as usize,
+            "MCTS arena exhausted u32 node IDs"
+        );
+        self.nodes.push(node);
+        index as NodeId
     }
 }
 
@@ -549,33 +588,50 @@ fn random_rollout<R: Rng + ?Sized>(mut board: Board, rng: &mut R, cap: usize) ->
     score
 }
 
-fn simulate<R: Rng + ?Sized>(node: &mut Node, cfg: &SearchCfg, rng: &mut R) -> u64 {
-    if node.terminal() {
+fn simulate<R: Rng + ?Sized>(
+    tree: &mut Tree,
+    node_id: NodeId,
+    cfg: &SearchCfg,
+    rng: &mut R,
+) -> u64 {
+    if tree.node(node_id).terminal() {
         return 0;
     }
-    node.visits += 1;
-    let edge_i = select_edge(node, cfg, rng);
+
+    tree.node_mut(node_id).visits += 1;
+    let edge_i = {
+        let node = tree.node(node_id);
+        select_edge(node, cfg, rng)
+    };
 
     let (moved, immediate) = {
-        let e = &node.edges[edge_i];
-        (e.moved, e.immediate_reward)
+        let edge = &tree.node(node_id).edges[edge_i];
+        (edge.moved, edge.immediate_reward)
     };
     let spawned = moved.spawn(rng);
 
-    let downstream = {
-        let edge = &mut node.edges[edge_i];
-        if let Some(child) = edge.children.get_mut(&spawned) {
-            simulate(child, cfg, rng)
-        } else {
-            let rollout = random_rollout(spawned, rng, cfg.rollout_cap);
-            edge.children.insert(spawned, Box::new(Node::new(spawned)));
-            rollout
-        }
+    // Do not retain any references into the arena across recursion: pushing a
+    // newly expanded node may reallocate the Vec. Integer IDs remain stable.
+    let child_id = tree.node(node_id).edges[edge_i]
+        .children
+        .get(&spawned)
+        .copied();
+    let downstream = if let Some(child_id) = child_id {
+        simulate(tree, child_id, cfg, rng)
+    } else {
+        // Preserve the old RNG/expansion order exactly: rollout first, then
+        // materialize the newly encountered child.
+        let rollout = random_rollout(spawned, rng, cfg.rollout_cap);
+        let child_id = tree.alloc(Node::new(spawned));
+        tree.node_mut(node_id).edges[edge_i]
+            .children
+            .insert(spawned, child_id);
+        rollout
     };
 
     let total = immediate + downstream;
     let observed = cfg.reward_transform.apply(total as f64);
-    node.edges[edge_i].stats.observe(observed);
+    tree.node_mut(node_id).edges[edge_i].stats.observe(observed);
     total
 }
 
@@ -585,16 +641,20 @@ fn choose_move<R: Rng + ?Sized>(
     cfg: &SearchCfg,
     rng: &mut R,
 ) -> Option<Dir> {
-    let mut root = Node::new(board);
-    if root.terminal() {
+    // One simulation can expand at most one node, so this avoids arena growth
+    // for the fixed-budget benchmark path.
+    let mut tree = Tree::with_capacity(board, simulations.saturating_add(1));
+    let root_id = Tree::ROOT;
+    if tree.node(root_id).terminal() {
         return None;
     }
     for _ in 0..simulations {
-        simulate(&mut root, cfg, rng);
+        simulate(&mut tree, root_id, cfg, rng);
     }
 
     // Terminal Bayes action: maximize posterior expected return.
-    root.edges
+    tree.node(root_id)
+        .edges
         .iter()
         .max_by(|a, b| a.stats.mean.total_cmp(&b.stats.mean))
         .map(|e| e.dir)
@@ -1196,8 +1256,13 @@ fn search_move_with_diagnostics<R: Rng + ?Sized>(
 ) -> io::Result<Option<SearchOutcome>> {
     const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
-    let mut root = Node::new(board);
-    if root.terminal() {
+    let arena_capacity = match budget {
+        SearchBudget::Simulations(limit) => limit.saturating_add(1),
+        SearchBudget::Time(_) | SearchBudget::Unlimited => 1024,
+    };
+    let mut tree = Tree::with_capacity(board, arena_capacity);
+    let root_id = Tree::ROOT;
+    if tree.node(root_id).terminal() {
         return Ok(None);
     }
 
@@ -1219,8 +1284,10 @@ fn search_move_with_diagnostics<R: Rng + ?Sized>(
     let mut last_rendered_state = None;
     let mut selected_dir = None;
     let min_time_budget_sims = match cfg.policy {
-        Policy::Uct => root.edges.len(),
-        Policy::Thompson | Policy::ExactVoc | Policy::McVoc(_) => 3 * root.edges.len(),
+        Policy::Uct => tree.node(root_id).edges.len(),
+        Policy::Thompson | Policy::ExactVoc | Policy::McVoc(_) => {
+            3 * tree.node(root_id).edges.len()
+        }
     } as u32;
 
     loop {
@@ -1249,7 +1316,7 @@ fn search_move_with_diagnostics<R: Rng + ?Sized>(
                 LiveCommand::Continue => {}
                 LiveCommand::ActBest => break,
                 LiveCommand::Force(dir) => {
-                    if root.edges.iter().any(|edge| edge.dir == dir) {
+                    if tree.node(root_id).edges.iter().any(|edge| edge.dir == dir) {
                         runtime.session.set_notice(format!("forcing {dir}"));
                         selected_dir = Some(dir);
                         break;
@@ -1274,7 +1341,7 @@ fn search_move_with_diagnostics<R: Rng + ?Sized>(
             break;
         }
 
-        simulate(&mut root, cfg, rng);
+        simulate(&mut tree, root_id, cfg, rng);
         sims_done += 1;
 
         let compute_elapsed = wall_start.elapsed().saturating_sub(excluded_overhead);
@@ -1282,7 +1349,7 @@ fn search_move_with_diagnostics<R: Rng + ?Sized>(
             && frame_due <= compute_elapsed
         {
             let render_start = Instant::now();
-            let snapshot = snapshot_root(&root);
+            let snapshot = snapshot_root(tree.node(root_id));
             let runtime = live.as_ref().expect("frame rendering requires live mode");
             render_search_frame(
                 board,
@@ -1307,7 +1374,7 @@ fn search_move_with_diagnostics<R: Rng + ?Sized>(
 
     let compute_elapsed = wall_start.elapsed().saturating_sub(excluded_overhead);
     let final_frame_start = Instant::now();
-    let snapshot = snapshot_root(&root);
+    let snapshot = snapshot_root(tree.node(root_id));
     if let Some(runtime) = live.as_ref()
         && last_rendered_state != Some((sims_done, runtime.session.revision))
     {
@@ -1842,6 +1909,17 @@ mod tests {
             stats.observe(value);
         }
         stats
+    }
+
+    #[test]
+    fn arena_node_ids_survive_vec_growth() {
+        let root_board = Board::empty();
+        let mut tree = Tree::with_capacity(root_board, 1);
+        let root = Tree::ROOT;
+        for _ in 0..1024 {
+            tree.alloc(Node::new(root_board));
+        }
+        assert_eq!(tree.node(root)._board, root_board);
     }
 
     #[test]
