@@ -403,6 +403,32 @@ fn exact_voc(stats: Stats, other_best: f64) -> f64 {
     one_step_mean_distribution(stats, other_best).map_or(0.0, |distribution| distribution.voc())
 }
 
+/// Maximum one-step exact VOC among root actions, in the search allocator's
+/// reward units. A single legal action has zero decision value: there is
+/// nothing another simulation can change about which move will be played.
+fn max_exact_voc(node: &Node) -> f64 {
+    if node.edges.len() <= 1 {
+        return 0.0;
+    }
+    if node.edges.iter().any(|edge| edge.stats.n < 3) {
+        return f64::INFINITY;
+    }
+
+    let means: Vec<f64> = node.edges.iter().map(|edge| edge.stats.mean).collect();
+    node.edges
+        .iter()
+        .enumerate()
+        .map(|(i, edge)| {
+            let other_best = means
+                .iter()
+                .enumerate()
+                .filter_map(|(j, &mean)| (i != j).then_some(mean))
+                .fold(f64::NEG_INFINITY, f64::max);
+            exact_voc(edge.stats, other_best)
+        })
+        .fold(0.0, f64::max)
+}
+
 fn one_step_voc_and_switch(stats: Stats, other_best: f64) -> (f64, f64) {
     // A dashboard snapshot needs both values, so reuse its Student-t object.
     // The exact-VOC selection hot path above deliberately computes VOC alone.
@@ -628,6 +654,9 @@ struct TraceStep {
     search_budget_ms: Option<f64>,
     search_budget_simulations: Option<usize>,
     search_unlimited: bool,
+    search_stopped_by_voc: bool,
+    search_max_voc: f64,
+    search_voc_cost: Option<f64>,
     spawn_index: usize,
     spawn_tile: u64,
     board_after: [u64; 16],
@@ -640,6 +669,7 @@ struct GameTrace {
     policy: String,
     simulations: Option<usize>,
     time_ms: Option<f64>,
+    voc_cost: Option<f64>,
     final_score: u64,
     max_tile: u64,
     moves: Vec<TraceStep>,
@@ -1030,6 +1060,8 @@ struct SearchOutcome {
     compute_elapsed: Duration,
     wall_elapsed: Duration,
     excluded_overhead: Duration,
+    stopped_by_voc: bool,
+    max_voc: f64,
 }
 
 struct LiveSearchRuntime<'a> {
@@ -1193,6 +1225,7 @@ fn search_move_with_diagnostics<R: Rng + ?Sized>(
     cfg: &SearchCfg,
     rng: &mut R,
     mut live: Option<LiveSearchRuntime<'_>>,
+    voc_cost: Option<f64>,
 ) -> io::Result<Option<SearchOutcome>> {
     const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
@@ -1218,6 +1251,7 @@ fn search_move_with_diagnostics<R: Rng + ?Sized>(
         .map(|_| Duration::ZERO);
     let mut last_rendered_state = None;
     let mut selected_dir = None;
+    let mut stopped_by_voc = false;
     let min_time_budget_sims = match cfg.policy {
         Policy::Uct => root.edges.len(),
         Policy::Thompson | Policy::ExactVoc | Policy::McVoc(_) => 3 * root.edges.len(),
@@ -1259,6 +1293,34 @@ fn search_move_with_diagnostics<R: Rng + ?Sized>(
                         .set_notice(format!("ignored: {dir} is illegal"));
                 }
                 LiveCommand::Quit => return Ok(None),
+            }
+        }
+
+        // A VOC price turns the outer budget into a ceiling rather than a
+        // quota. Bootstrap every competing root action to n=3 first because
+        // the Jeffreys-Normal posterior mean/VOC is not defined before then.
+        // With only one legal action there is no decision to improve, so no
+        // bootstrap is necessary at all.
+        if let Some(raw_cost) = voc_cost {
+            let bootstrap_complete =
+                root.edges.len() <= 1 || root.edges.iter().all(|edge| 3 <= edge.stats.n);
+            if bootstrap_complete {
+                let max_voc = max_exact_voc(&root);
+                // --voc-cost is expressed in actual game-score units. The
+                // allocator may see an affine-scaled reward, so scale the
+                // price too; reward shifts cancel from VOC.
+                let effective_cost = raw_cost * cfg.reward_transform.scale;
+                if max_voc <= effective_cost {
+                    stopped_by_voc = true;
+                    if let Some(runtime) = live.as_mut() {
+                        runtime.session.set_notice(format!(
+                            "VOC stop: max {:.4} <= cost {:.4}",
+                            max_voc / cfg.reward_transform.scale,
+                            raw_cost,
+                        ));
+                    }
+                    break;
+                }
             }
         }
 
@@ -1330,6 +1392,8 @@ fn search_move_with_diagnostics<R: Rng + ?Sized>(
         compute_elapsed,
         wall_elapsed: wall_start.elapsed(),
         excluded_overhead,
+        stopped_by_voc,
+        max_voc: max_exact_voc(&root) / cfg.reward_transform.scale,
     }))
 }
 
@@ -1340,6 +1404,7 @@ fn play_trace(
     rollout_cap: usize,
     transform: RewardTransform,
     live_frame_interval: Option<Duration>,
+    voc_cost: Option<f64>,
 ) -> io::Result<GameTrace> {
     let mut env_rng = SmallRng::seed_from_u64(seed);
     let mut board = Board::initial(&mut env_rng);
@@ -1364,7 +1429,7 @@ fn play_trace(
             context: LiveSearch { move_index, score },
         });
         let Some(search) =
-            search_move_with_diagnostics(board, budget, &cfg, &mut search_rng, live)?
+            search_move_with_diagnostics(board, budget, &cfg, &mut search_rng, live, voc_cost)?
         else {
             break;
         };
@@ -1406,6 +1471,9 @@ fn play_trace(
             search_budget_ms,
             search_budget_simulations,
             search_unlimited,
+            search_stopped_by_voc: search.stopped_by_voc,
+            search_max_voc: search.max_voc,
+            search_voc_cost: voc_cost,
             spawn_index,
             spawn_tile,
             board_after: board_values(spawned),
@@ -1429,6 +1497,7 @@ fn play_trace(
         policy: policy.name(),
         simulations,
         time_ms,
+        voc_cost,
         final_score: score,
         max_tile: board.max_tile(),
         moves,
@@ -1552,6 +1621,12 @@ struct Args {
     #[arg(long)]
     time_ms: Option<f64>,
 
+    /// Stop buying root simulations once max one-step exact VOC is at or
+    /// below this price, expressed in actual 2048 score units per simulation.
+    /// The fixed simulation/time budget remains a hard safety ceiling.
+    #[arg(long)]
+    voc_cost: Option<f64>,
+
     /// Live terminal refresh interval in milliseconds while searching.
     #[arg(long, default_value_t = 50.0)]
     frame_ms: f64,
@@ -1616,6 +1691,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.time_ms.is_some() && !args.play && args.trace_json.is_none() {
         return Err("--time-ms currently requires --play or --trace-json".into());
     }
+    if let Some(cost) = args.voc_cost {
+        if !cost.is_finite() || cost < 0.0 {
+            return Err("--voc-cost must be finite and nonnegative".into());
+        }
+        if !single_game {
+            return Err("--voc-cost currently requires --play or --trace-json".into());
+        }
+        if policies.len() != 1 || !matches!(policies[0], Policy::ExactVoc) {
+            return Err("--voc-cost currently requires --policies exact-voc".into());
+        }
+    }
 
     if single_game {
         if policies.len() != 1 {
@@ -1648,6 +1734,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             transform,
             args.play
                 .then(|| Duration::from_secs_f64(args.frame_ms / 1000.0)),
+            args.voc_cost,
         )?;
 
         if let Some(trace_path) = &args.trace_json {
@@ -1979,6 +2066,7 @@ mod tests {
             SearchBudget::Simulations(64),
             &cfg,
             &mut diagnostic_rng,
+            None,
             None,
         )
         .unwrap()
