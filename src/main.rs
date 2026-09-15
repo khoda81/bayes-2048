@@ -43,6 +43,17 @@ impl fmt::Display for Dir {
     }
 }
 
+impl Dir {
+    fn symbol(self) -> char {
+        match self {
+            Self::Up => '↑',
+            Self::Down => '↓',
+            Self::Left => '←',
+            Self::Right => '→',
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Board([u8; 16]); // exponent: 0=empty, 1=2, 2=4, ...
 
@@ -1138,13 +1149,12 @@ fn render_search_frame(
     )
     .expect("writing to String cannot fail");
     for dir in DIRS {
+        let mark = if snapshot.best_dir == dir { '*' } else { ' ' };
+        write!(output, " {} {:<2}|", mark, dir.symbol()).expect("writing to String cannot fail");
         if let Some(action) = snapshot.action(dir) {
-            let mark = if snapshot.best_dir == dir { '*' } else { ' ' };
             writeln!(
                 output,
-                "{}{:>4} | {:>6} | {:>5.1}% | {:>10.1} | {:>8.1} | {:>9.1} | {:>9.4} | {:>5.1}%",
-                mark,
-                action.dir,
+                " {:>6} | {:>5.1}% | {:>10.1} | {:>8.1} | {:>9.1} | {:>9.4} | {:>5.1}%",
                 action.samples,
                 100.0 * action.share,
                 action.mean,
@@ -1157,8 +1167,8 @@ fn render_search_frame(
         } else {
             writeln!(
                 output,
-                " {:>4} | {:>6} | {:>6} | {:>10} | {:>8} | {:>9} | {:>9} | {:>6}",
-                dir, "-", "-", "illegal", "-", "-", "-", "-",
+                " {:>6} | {:>6} | {:>10} | {:>8} | {:>9} | {:>9} | {:>6}",
+                "-", "-", "illegal", "-", "-", "-", "-",
             )
             .expect("writing to String cannot fail");
         }
@@ -1935,6 +1945,17 @@ mod tests {
         let mut output = String::new();
         write_compact_board(&mut output, board).unwrap();
         assert_eq!(output, ". 1 9 a\nb c 2 3\n4 5 6 7\n8 . . .\n");
+    }
+
+    #[test]
+    fn direction_symbols_have_fixed_width_labels() {
+        let labels: Vec<String> = DIRS
+            .into_iter()
+            .map(|dir| format!("  {:<2}|", dir.symbol()))
+            .collect();
+
+        assert_eq!(labels, ["  ↑ |", "  ↓ |", "  ← |", "  → |"]);
+        assert!(labels.iter().all(|label| label.chars().count() == 5));
     }
 
     #[test]
