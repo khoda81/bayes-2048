@@ -12,6 +12,7 @@ use rand::rngs::SmallRng;
 use rand_distr::{Distribution, StudentT};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use statrs::distribution::{Continuous, ContinuousCDF, StudentsT};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
@@ -231,7 +232,7 @@ struct Node {
     // comparable; live root rendering receives its board explicitly.
     _board: Board,
     visits: u32,
-    edges: Vec<Edge>,
+    edges: SmallVec<[Edge; 4]>,
 }
 
 impl Node {
@@ -240,7 +241,7 @@ impl Node {
             .legal_moves()
             .into_iter()
             .map(|(d, b, r)| Edge::new(d, b, r))
-            .collect();
+            .collect::<SmallVec<[Edge; 4]>>();
         Self {
             _board: board,
             visits: 0,
