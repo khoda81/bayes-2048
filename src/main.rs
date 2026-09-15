@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use std::fs::{self, OpenOptions};
 use std::io::{self, IsTerminal, Write as IoWrite};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,22 +36,11 @@ enum Dir {
 impl fmt::Display for Dir {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Dir::Up => "up",
-            Dir::Down => "down",
-            Dir::Left => "left",
-            Dir::Right => "right",
+            Self::Up => "↑",
+            Self::Down => "↓",
+            Self::Left => "←",
+            Self::Right => "→",
         })
-    }
-}
-
-impl Dir {
-    fn symbol(self) -> char {
-        match self {
-            Self::Up => '↑',
-            Self::Down => '↓',
-            Self::Left => '←',
-            Self::Right => '→',
-        }
     }
 }
 
@@ -824,11 +814,48 @@ fn write_compact_board(output: &mut String, board: Board) -> fmt::Result {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SearchBudget {
-    Simulations(usize),
-    Time(Duration),
-    Unlimited,
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct SearchConstraints {
+    simulation_limit: Option<NonZeroUsize>,
+    time_limit: Option<Duration>,
+    min_voc: Option<f64>,
+}
+
+impl SearchConstraints {
+    fn has_stopping_condition(self) -> bool {
+        self.simulation_limit.is_some() || self.time_limit.is_some() || self.min_voc.is_some()
+    }
+
+    fn simulation_exhausted(self, simulations: u32) -> bool {
+        self.simulation_limit
+            .is_some_and(|limit| limit.get() <= simulations as usize)
+    }
+
+    fn time_exhausted(self, elapsed: Duration) -> bool {
+        self.time_limit.is_some_and(|limit| limit <= elapsed)
+    }
+
+    fn hard_limits_disabled(self) -> bool {
+        self.simulation_limit.is_none() && self.time_limit.is_none()
+    }
+
+    fn describe(self) -> String {
+        let mut parts = Vec::new();
+        if let Some(limit) = self.simulation_limit {
+            parts.push(format!("{} sims", limit.get()));
+        }
+        if let Some(limit) = self.time_limit {
+            parts.push(format!("{:.0} ms", limit.as_secs_f64() * 1000.0));
+        }
+        if let Some(min_voc) = self.min_voc {
+            parts.push(format!("VOC >= {min_voc:.4}"));
+        }
+        if parts.is_empty() {
+            "no automatic stop".into()
+        } else {
+            parts.join(" + ")
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -901,8 +928,9 @@ impl Drop for LiveTerminal {
 
 struct LiveSession {
     terminal: LiveTerminal,
-    budget: SearchBudget,
-    last_limited_budget: SearchBudget,
+    constraints: SearchConstraints,
+    saved_simulation_limit: Option<NonZeroUsize>,
+    saved_time_limit: Option<Duration>,
     frame_interval: Duration,
     notice: String,
     revision: u64,
@@ -915,12 +943,12 @@ impl LiveSession {
     const FRAME_STEP: Duration = Duration::from_millis(10);
     const MIN_FRAME: Duration = Duration::from_millis(10);
 
-    fn new(budget: SearchBudget, frame_interval: Duration) -> io::Result<Self> {
-        debug_assert!(!matches!(budget, SearchBudget::Unlimited));
+    fn new(constraints: SearchConstraints, frame_interval: Duration) -> io::Result<Self> {
         Ok(Self {
             terminal: LiveTerminal::enter()?,
-            budget,
-            last_limited_budget: budget,
+            constraints,
+            saved_simulation_limit: constraints.simulation_limit,
+            saved_time_limit: constraints.time_limit,
             frame_interval,
             notice: "searching".into(),
             revision: 0,
@@ -936,41 +964,45 @@ impl LiveSession {
         self.revision = self.revision.wrapping_add(1);
     }
 
-    fn toggle_unlimited(&mut self) {
-        if matches!(self.budget, SearchBudget::Unlimited) {
-            self.budget = self.last_limited_budget;
-            self.set_notice(format!("restored {}", describe_budget(self.budget)));
+    fn toggle_resource_limits(&mut self) {
+        if self.constraints.hard_limits_disabled() {
+            self.constraints.simulation_limit = self
+                .saved_simulation_limit
+                .or_else(|| NonZeroUsize::new(512));
+            self.constraints.time_limit = self.saved_time_limit;
+            self.set_notice(format!("restored {}", self.constraints.describe()));
         } else {
-            self.last_limited_budget = self.budget;
-            self.budget = SearchBudget::Unlimited;
-            self.set_notice("timeout disabled; press space to act");
+            self.saved_simulation_limit = self.constraints.simulation_limit;
+            self.saved_time_limit = self.constraints.time_limit;
+            self.constraints.simulation_limit = None;
+            self.constraints.time_limit = None;
+            self.set_notice("resource caps disabled; other stop constraints remain active");
         }
     }
 
-    fn adjust_budget(&mut self, increase: bool) {
-        let base = if matches!(self.budget, SearchBudget::Unlimited) {
-            self.last_limited_budget
+    fn adjust_resource_limit(&mut self, increase: bool) {
+        if let Some(duration) = self.constraints.time_limit {
+            let adjusted = if increase {
+                duration.saturating_add(Self::TIME_STEP)
+            } else {
+                duration.saturating_sub(Self::TIME_STEP).max(Self::MIN_TIME)
+            };
+            self.constraints.time_limit = Some(adjusted);
+            self.saved_time_limit = Some(adjusted);
         } else {
-            self.budget
-        };
-        let adjusted = match base {
-            SearchBudget::Time(duration) if increase => {
-                SearchBudget::Time(duration.saturating_add(Self::TIME_STEP))
-            }
-            SearchBudget::Time(duration) => {
-                SearchBudget::Time(duration.saturating_sub(Self::TIME_STEP).max(Self::MIN_TIME))
-            }
-            SearchBudget::Simulations(count) if increase => {
-                SearchBudget::Simulations(count.saturating_add(Self::SIMULATION_STEP))
-            }
-            SearchBudget::Simulations(count) => {
-                SearchBudget::Simulations(count.saturating_sub(Self::SIMULATION_STEP).max(1))
-            }
-            SearchBudget::Unlimited => unreachable!("unlimited uses last_limited_budget"),
-        };
-        self.budget = adjusted;
-        self.last_limited_budget = adjusted;
-        self.set_notice(format!("budget changed to {}", describe_budget(adjusted)));
+            let current = self
+                .constraints
+                .simulation_limit
+                .map_or(512, NonZeroUsize::get);
+            let adjusted = if increase {
+                current.saturating_add(Self::SIMULATION_STEP)
+            } else {
+                current.saturating_sub(Self::SIMULATION_STEP).max(1)
+            };
+            self.constraints.simulation_limit = NonZeroUsize::new(adjusted);
+            self.saved_simulation_limit = self.constraints.simulation_limit;
+        }
+        self.set_notice(format!("constraints {}", self.constraints.describe()));
     }
 
     fn adjust_frame_interval(&mut self, increase: bool) {
@@ -1006,15 +1038,15 @@ impl LiveSession {
             KeyCode::Left => LiveCommand::Force(Dir::Left),
             KeyCode::Right => LiveCommand::Force(Dir::Right),
             KeyCode::Char('i') => {
-                self.toggle_unlimited();
+                self.toggle_resource_limits();
                 LiveCommand::Continue
             }
             KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::PageUp => {
-                self.adjust_budget(true);
+                self.adjust_resource_limit(true);
                 LiveCommand::Continue
             }
             KeyCode::Char('-') | KeyCode::PageDown => {
-                self.adjust_budget(false);
+                self.adjust_resource_limit(false);
                 LiveCommand::Continue
             }
             KeyCode::Char('[') => {
@@ -1042,20 +1074,10 @@ impl LiveSession {
     }
 }
 
-fn describe_budget(budget: SearchBudget) -> String {
-    match budget {
-        SearchBudget::Time(duration) => {
-            format!("{:.0} ms", duration.as_secs_f64() * 1000.0)
-        }
-        SearchBudget::Simulations(count) => format!("{count} simulations"),
-        SearchBudget::Unlimited => "unlimited thinking".into(),
-    }
-}
-
 struct SearchOutcome {
     dir: Dir,
     root: RootSnapshot,
-    budget: SearchBudget,
+    constraints: SearchConstraints,
     simulations: u32,
     compute_elapsed: Duration,
     wall_elapsed: Duration,
@@ -1109,46 +1131,59 @@ fn render_search_frame(
     )
     .expect("writing to String cannot fail");
 
-    match session.budget {
-        SearchBudget::Time(duration) => {
-            let fraction = compute_seconds / duration.as_secs_f64();
-            writeln!(
-                output,
-                "think {:>6.1}/{:<6.1} ms [{}] {:>3.0}% | {:>7} sims | {:>8.0} sims/s",
-                compute_seconds * 1000.0,
-                duration.as_secs_f64() * 1000.0,
-                progress_bar(fraction),
-                100.0 * fraction.clamp(0.0, 1.0),
-                snapshot.total_samples,
-                sims_per_second,
-            )
-            .expect("writing to String cannot fail");
-        }
-        SearchBudget::Simulations(simulations) => {
-            let fraction = snapshot.total_samples as f64 / simulations.max(1) as f64;
-            writeln!(
-                output,
-                "think {:>7}/{:<7} sims [{}] {:>3.0}% | {:>8.1} ms | {:>8.0} sims/s",
-                snapshot.total_samples,
-                simulations,
-                progress_bar(fraction),
-                100.0 * fraction.clamp(0.0, 1.0),
-                compute_seconds * 1000.0,
-                sims_per_second,
-            )
-            .expect("writing to String cannot fail");
-        }
-        SearchBudget::Unlimited => {
-            writeln!(
-                output,
-                "think {:>8.1} ms [       unlimited        ] | {:>7} sims | {:>8.0} sims/s",
-                compute_seconds * 1000.0,
-                snapshot.total_samples,
-                sims_per_second,
-            )
-            .expect("writing to String cannot fail");
-        }
+    let hard_fraction = [
+        session
+            .constraints
+            .simulation_limit
+            .map(|limit| snapshot.total_samples as f64 / limit.get() as f64),
+        session
+            .constraints
+            .time_limit
+            .map(|limit| compute_elapsed.as_secs_f64() / limit.as_secs_f64()),
+    ]
+    .into_iter()
+    .flatten()
+    .fold(None::<f64>, |acc, x| Some(acc.map_or(x, |a| a.max(x))));
+
+    if let Some(fraction) = hard_fraction {
+        writeln!(
+            output,
+            "think {:>8.1} ms | {:>7} sims [{}] {:>3.0}% | {:>8.0} sims/s",
+            compute_seconds * 1000.0,
+            snapshot.total_samples,
+            progress_bar(fraction),
+            100.0 * fraction.clamp(0.0, 1.0),
+            sims_per_second,
+        )
+        .expect("writing to String cannot fail");
+    } else {
+        writeln!(
+            output,
+            "think {:>8.1} ms | {:>7} sims [   no resource cap    ] | {:>8.0} sims/s",
+            compute_seconds * 1000.0,
+            snapshot.total_samples,
+            sims_per_second,
+        )
+        .expect("writing to String cannot fail");
     }
+
+    let sim_limit = session
+        .constraints
+        .simulation_limit
+        .map_or_else(|| "off".into(), |n| n.get().to_string());
+    let time_limit = session.constraints.time_limit.map_or_else(
+        || "off".into(),
+        |d| format!("{:.1} ms", d.as_secs_f64() * 1000.0),
+    );
+    let voc_limit = session
+        .constraints
+        .min_voc
+        .map_or_else(|| "off".into(), |v| format!("{v:.4}"));
+    writeln!(
+        output,
+        "limits sims {sim_limit} | time {time_limit} | min VOC {voc_limit}"
+    )
+    .expect("writing to String cannot fail");
 
     writeln!(
         output,
@@ -1182,7 +1217,7 @@ fn render_search_frame(
     .expect("writing to String cannot fail");
     for dir in DIRS {
         let mark = if snapshot.best_dir == dir { '*' } else { ' ' };
-        write!(output, " {} {:<2}|", mark, dir.symbol()).expect("writing to String cannot fail");
+        write!(output, " {mark} {dir:<2}|").expect("writing to String cannot fail");
         if let Some(action) = snapshot.action(dir) {
             writeln!(
                 output,
@@ -1212,7 +1247,7 @@ fn render_search_frame(
     .expect("writing to String cannot fail");
     writeln!(
         output,
-        "keys: space/enter act | arrows force | +/- budget | i infinite | [/] refresh | q quit"
+        "keys: space/enter act | arrows force | +/- resource cap | i toggle resource caps | [/] refresh | q quit"
     )
     .expect("writing to String cannot fail");
 
@@ -1221,11 +1256,10 @@ fn render_search_frame(
 
 fn search_move_with_diagnostics<R: Rng + ?Sized>(
     board: Board,
-    budget: SearchBudget,
+    constraints: SearchConstraints,
     cfg: &SearchCfg,
     rng: &mut R,
     mut live: Option<LiveSearchRuntime<'_>>,
-    voc_cost: Option<f64>,
 ) -> io::Result<Option<SearchOutcome>> {
     const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
@@ -1241,9 +1275,9 @@ fn search_move_with_diagnostics<R: Rng + ?Sized>(
     let wall_start = Instant::now();
     let mut excluded_overhead = Duration::ZERO;
     let mut sims_done = 0u32;
-    let mut active_budget = live
+    let mut active_constraints = live
         .as_ref()
-        .map_or(budget, |runtime| runtime.session.budget);
+        .map_or(constraints, |runtime| runtime.session.constraints);
     let mut next_frame = live.as_ref().map(|runtime| runtime.session.frame_interval);
     let mut next_input_poll = live
         .as_ref()
@@ -1252,10 +1286,6 @@ fn search_move_with_diagnostics<R: Rng + ?Sized>(
     let mut last_rendered_state = None;
     let mut selected_dir = None;
     let mut stopped_by_voc = false;
-    let min_time_budget_sims = match cfg.policy {
-        Policy::Uct => root.edges.len(),
-        Policy::Thompson | Policy::ExactVoc | Policy::McVoc(_) => 3 * root.edges.len(),
-    } as u32;
 
     loop {
         let compute_elapsed = wall_start.elapsed().saturating_sub(excluded_overhead);
@@ -1267,7 +1297,7 @@ fn search_move_with_diagnostics<R: Rng + ?Sized>(
             let runtime = live.as_mut().expect("input polling requires live mode");
             let old_frame_interval = runtime.session.frame_interval;
             let command = runtime.session.poll_command()?;
-            active_budget = runtime.session.budget;
+            active_constraints = runtime.session.constraints;
             if old_frame_interval != runtime.session.frame_interval {
                 next_frame = Some(compute_elapsed + runtime.session.frame_interval);
             }
@@ -1296,44 +1326,35 @@ fn search_move_with_diagnostics<R: Rng + ?Sized>(
             }
         }
 
-        // A VOC price turns the outer budget into a ceiling rather than a
-        // quota. Bootstrap every competing root action to n=3 first because
-        // the Jeffreys-Normal posterior mean/VOC is not defined before then.
-        // With only one legal action there is no decision to improve, so no
-        // bootstrap is necessary at all.
-        if let Some(raw_cost) = voc_cost {
+        // Every enabled field is an independent stopping constraint. Hard
+        // resource limits are always enforced. The VOC constraint becomes
+        // evaluable once each competing root action has the n=3 bootstrap
+        // required by the Jeffreys-Normal model.
+        let compute_elapsed = wall_start.elapsed().saturating_sub(excluded_overhead);
+        if active_constraints.simulation_exhausted(sims_done)
+            || active_constraints.time_exhausted(compute_elapsed)
+        {
+            break;
+        }
+
+        if let Some(min_voc) = active_constraints.min_voc {
             let bootstrap_complete =
                 root.edges.len() <= 1 || root.edges.iter().all(|edge| 3 <= edge.stats.n);
             if bootstrap_complete {
                 let max_voc = max_exact_voc(&root);
-                // --voc-cost is expressed in actual game-score units. The
-                // allocator may see an affine-scaled reward, so scale the
-                // price too; reward shifts cancel from VOC.
-                let effective_cost = raw_cost * cfg.reward_transform.scale;
-                if max_voc <= effective_cost {
+                let effective_min_voc = min_voc * cfg.reward_transform.scale;
+                if max_voc <= effective_min_voc {
                     stopped_by_voc = true;
                     if let Some(runtime) = live.as_mut() {
                         runtime.session.set_notice(format!(
-                            "VOC stop: max {:.4} <= cost {:.4}",
+                            "VOC stop: max {:.4} <= min {:.4}",
                             max_voc / cfg.reward_transform.scale,
-                            raw_cost,
+                            min_voc,
                         ));
                     }
                     break;
                 }
             }
-        }
-
-        let compute_elapsed = wall_start.elapsed().saturating_sub(excluded_overhead);
-        let budget_exhausted = match active_budget {
-            SearchBudget::Simulations(limit) => limit <= sims_done as usize,
-            SearchBudget::Time(limit) => {
-                limit <= compute_elapsed && min_time_budget_sims <= sims_done
-            }
-            SearchBudget::Unlimited => false,
-        };
-        if budget_exhausted {
-            break;
         }
 
         simulate(&mut root, cfg, rng);
@@ -1387,7 +1408,7 @@ fn search_move_with_diagnostics<R: Rng + ?Sized>(
     Ok(Some(SearchOutcome {
         dir: selected_dir.unwrap_or(snapshot.best_dir),
         root: snapshot,
-        budget: active_budget,
+        constraints: active_constraints,
         simulations: sims_done,
         compute_elapsed,
         wall_elapsed: wall_start.elapsed(),
@@ -1400,11 +1421,10 @@ fn search_move_with_diagnostics<R: Rng + ?Sized>(
 fn play_trace(
     seed: u64,
     policy: Policy,
-    budget: SearchBudget,
+    constraints: SearchConstraints,
     rollout_cap: usize,
     transform: RewardTransform,
     live_frame_interval: Option<Duration>,
-    voc_cost: Option<f64>,
 ) -> io::Result<GameTrace> {
     let mut env_rng = SmallRng::seed_from_u64(seed);
     let mut board = Board::initial(&mut env_rng);
@@ -1416,7 +1436,7 @@ fn play_trace(
         reward_transform: transform,
     };
     let mut live_session = live_frame_interval
-        .map(|frame_interval| LiveSession::new(budget, frame_interval))
+        .map(|frame_interval| LiveSession::new(constraints, frame_interval))
         .transpose()?;
 
     loop {
@@ -1429,7 +1449,7 @@ fn play_trace(
             context: LiveSearch { move_index, score },
         });
         let Some(search) =
-            search_move_with_diagnostics(board, budget, &cfg, &mut search_rng, live, voc_cost)?
+            search_move_with_diagnostics(board, constraints, &cfg, &mut search_rng, live)?
         else {
             break;
         };
@@ -1451,11 +1471,12 @@ fn play_trace(
             let e = spawned.0[spawn_index];
             if e == 0 { 0 } else { 1u64 << e }
         };
-        let (search_budget_ms, search_budget_simulations, search_unlimited) = match search.budget {
-            SearchBudget::Time(duration) => (Some(duration.as_secs_f64() * 1000.0), None, false),
-            SearchBudget::Simulations(count) => (None, Some(count), false),
-            SearchBudget::Unlimited => (None, None, true),
-        };
+        let search_budget_ms = search
+            .constraints
+            .time_limit
+            .map(|duration| duration.as_secs_f64() * 1000.0);
+        let search_budget_simulations = search.constraints.simulation_limit.map(NonZeroUsize::get);
+        let search_unlimited = search.constraints.hard_limits_disabled();
 
         moves.push(TraceStep {
             move_index,
@@ -1473,7 +1494,7 @@ fn play_trace(
             search_unlimited,
             search_stopped_by_voc: search.stopped_by_voc,
             search_max_voc: search.max_voc,
-            search_voc_cost: voc_cost,
+            search_voc_cost: search.constraints.min_voc,
             spawn_index,
             spawn_tile,
             board_after: board_values(spawned),
@@ -1487,17 +1508,16 @@ fn play_trace(
         board = spawned;
     }
 
-    let (simulations, time_ms) = match budget {
-        SearchBudget::Simulations(count) => (Some(count), None),
-        SearchBudget::Time(duration) => (None, Some(duration.as_secs_f64() * 1000.0)),
-        SearchBudget::Unlimited => unreachable!("CLI budget is always limited"),
-    };
+    let simulations = constraints.simulation_limit.map(NonZeroUsize::get);
+    let time_ms = constraints
+        .time_limit
+        .map(|duration| duration.as_secs_f64() * 1000.0);
     Ok(GameTrace {
         seed,
         policy: policy.name(),
         simulations,
         time_ms,
-        voc_cost,
+        voc_cost: constraints.min_voc,
         final_score: score,
         max_tile: board.max_tile(),
         moves,
@@ -1587,9 +1607,10 @@ struct Args {
     #[arg(long, default_value_t = 20)]
     games: usize,
 
-    /// Comma-separated simulations per move.
-    #[arg(long, default_value = "8,16,32,64,128")]
-    budgets: String,
+    /// Comma-separated fixed simulation budgets for benchmark mode. In
+    /// single-game mode, one value is accepted as a legacy simulation limit.
+    #[arg(long)]
+    budgets: Option<String>,
 
     /// Comma-separated policies: uct, thompson, exact-voc, mc-voc-N.
     #[arg(long, default_value = "uct,thompson,mc-voc-8,mc-voc-32,mc-voc-128")]
@@ -1616,14 +1637,18 @@ struct Args {
     #[arg(long, default_value_t = false)]
     play: bool,
 
-    /// Wall-clock thinking budget per move in milliseconds for --play/--trace-json.
-    /// When set, --budgets is ignored for the single-game trace/play path.
+    /// Maximum simulations per move in --play/--trace-json mode.
+    #[arg(long)]
+    simulation_limit: Option<NonZeroUsize>,
+
+    /// Maximum search-compute time per move in milliseconds in
+    /// --play/--trace-json mode.
     #[arg(long)]
     time_ms: Option<f64>,
 
-    /// Stop buying root simulations once max one-step exact VOC is at or
-    /// below this price, expressed in actual 2048 score units per simulation.
-    /// The fixed simulation/time budget remains a hard safety ceiling.
+    /// Minimum root one-step VOC required to buy another simulation,
+    /// expressed in actual 2048 score units. This is an independent stopping
+    /// constraint alongside the simulation and time limits.
     #[arg(long)]
     voc_cost: Option<f64>,
 
@@ -1662,12 +1687,11 @@ fn parse_usizes(s: &str) -> Result<Vec<usize>, String> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let single_game = args.play || args.trace_json.is_some();
-    // A wall-clock single game does not consult the fixed-simulation budget at
-    // all. In particular, even an otherwise invalid --budgets value is ignored.
-    let budgets = if single_game && args.time_ms.is_some() {
+    const DEFAULT_BUDGETS: &str = "8,16,32,64,128";
+    let budgets = if single_game {
         Vec::new()
     } else {
-        parse_usizes(&args.budgets)?
+        parse_usizes(args.budgets.as_deref().unwrap_or(DEFAULT_BUDGETS))?
     };
     let policies: Vec<Policy> = args
         .policies
@@ -1688,8 +1712,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         shift: args.reward_shift,
     };
 
-    if args.time_ms.is_some() && !args.play && args.trace_json.is_none() {
-        return Err("--time-ms currently requires --play or --trace-json".into());
+    if args.simulation_limit.is_some() && !single_game {
+        return Err("--simulation-limit requires --play or --trace-json".into());
+    }
+    if args.time_ms.is_some() && !single_game {
+        return Err("--time-ms requires --play or --trace-json".into());
     }
     if let Some(cost) = args.voc_cost {
         if !cost.is_finite() || cost < 0.0 {
@@ -1710,31 +1737,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !args.frame_ms.is_finite() || args.frame_ms <= 0.0 {
             return Err("--frame-ms must be finite and positive".into());
         }
-        if let Some(ms) = args.time_ms {
+
+        let legacy_simulation_limit = if let Some(raw) = args.budgets.as_deref() {
+            if args.simulation_limit.is_some() {
+                return Err(
+                    "use either --simulation-limit or --budgets in single-game mode, not both"
+                        .into(),
+                );
+            }
+            let parsed = parse_usizes(raw)?;
+            if parsed.len() != 1 {
+                return Err(
+                    "single-game --budgets accepts exactly one value; prefer --simulation-limit"
+                        .into(),
+                );
+            }
+            NonZeroUsize::new(parsed[0])
+                .ok_or("simulation limit must be positive")?
+                .into()
+        } else {
+            None
+        };
+
+        let time_limit = if let Some(ms) = args.time_ms {
             if !ms.is_finite() || ms <= 0.0 {
                 return Err("--time-ms must be finite and positive".into());
             }
-        } else if budgets.len() != 1 {
+            Some(Duration::from_secs_f64(ms / 1000.0))
+        } else {
+            None
+        };
+
+        let constraints = SearchConstraints {
+            simulation_limit: args.simulation_limit.or(legacy_simulation_limit),
+            time_limit,
+            min_voc: args.voc_cost,
+        };
+        if !constraints.has_stopping_condition() && !args.play {
             return Err(
-                "without --time-ms, --play/--trace-json requires exactly one --budgets entry"
-                    .into(),
+                "non-interactive trace search needs at least one stopping constraint".into(),
             );
         }
+        if matches!(constraints.min_voc, Some(0.0))
+            && constraints.hard_limits_disabled()
+            && !args.play
+        {
+            return Err("--voc-cost 0 without a resource limit may not terminate".into());
+        }
 
-        let budget = if let Some(ms) = args.time_ms {
-            SearchBudget::Time(Duration::from_secs_f64(ms / 1000.0))
-        } else {
-            SearchBudget::Simulations(budgets[0])
-        };
         let trace = play_trace(
             args.seed,
             policies[0],
-            budget,
+            constraints,
             args.rollout_cap,
             transform,
             args.play
                 .then(|| Duration::from_secs_f64(args.frame_ms / 1000.0)),
-            args.voc_cost,
         )?;
 
         if let Some(trace_path) = &args.trace_json {
@@ -1746,16 +1804,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             fs::write(trace_path, serde_json::to_string_pretty(&trace)?)?;
         }
 
-        let budget = match (trace.time_ms, trace.simulations) {
-            (Some(ms), _) => format!("{ms:.1} ms/move"),
-            (_, Some(n)) => format!("{n} sims/move"),
-            _ => "unknown budget".into(),
+        let constraints = SearchConstraints {
+            simulation_limit: trace.simulations.and_then(NonZeroUsize::new),
+            time_limit: trace.time_ms.map(|ms| Duration::from_secs_f64(ms / 1000.0)),
+            min_voc: trace.voc_cost,
         };
         eprintln!(
-            "done: seed={} policy={} budget={} score={} tile={} moves={}",
+            "done: seed={} policy={} constraints={} score={} tile={} moves={}",
             trace.seed,
             trace.policy,
-            budget,
+            constraints.describe(),
             trace.final_score,
             trace.max_tile,
             trace.moves.len(),
@@ -2036,10 +2094,7 @@ mod tests {
 
     #[test]
     fn direction_symbols_have_fixed_width_labels() {
-        let labels: Vec<String> = DIRS
-            .into_iter()
-            .map(|dir| format!("  {:<2}|", dir.symbol()))
-            .collect();
+        let labels: Vec<String> = DIRS.into_iter().map(|dir| format!("  {dir:<2}|")).collect();
 
         assert_eq!(labels, ["  ↑ |", "  ↓ |", "  ← |", "  → |"]);
         assert!(labels.iter().all(|label| label.chars().count() == 5));
@@ -2063,10 +2118,12 @@ mod tests {
         let benchmark_choice = choose_move(board, 64, &cfg, &mut benchmark_rng);
         let diagnostic = search_move_with_diagnostics(
             board,
-            SearchBudget::Simulations(64),
+            SearchConstraints {
+                simulation_limit: NonZeroUsize::new(64),
+                ..SearchConstraints::default()
+            },
             &cfg,
             &mut diagnostic_rng,
-            None,
             None,
         )
         .unwrap()
@@ -2078,14 +2135,19 @@ mod tests {
     }
 
     #[test]
-    fn live_budget_controls_toggle_and_adjust() {
-        let initial = SearchBudget::Time(Duration::from_millis(300));
+    fn live_resource_constraints_toggle_and_adjust() {
+        let initial = SearchConstraints {
+            simulation_limit: NonZeroUsize::new(512),
+            time_limit: Some(Duration::from_millis(300)),
+            min_voc: Some(1.0),
+        };
         let mut session = LiveSession {
             terminal: LiveTerminal {
                 alternate_screen: false,
             },
-            budget: initial,
-            last_limited_budget: initial,
+            constraints: initial,
+            saved_simulation_limit: initial.simulation_limit,
+            saved_time_limit: initial.time_limit,
             frame_interval: Duration::from_millis(50),
             notice: String::new(),
             revision: 0,
@@ -2095,15 +2157,21 @@ mod tests {
             session.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),
             LiveCommand::Continue
         );
-        assert_eq!(session.budget, SearchBudget::Unlimited);
+        assert!(session.constraints.hard_limits_disabled());
+        assert_eq!(session.constraints.min_voc, Some(1.0));
 
+        session.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert_eq!(session.constraints, initial);
         session.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
         assert_eq!(
-            session.budget,
-            SearchBudget::Time(Duration::from_millis(350))
+            session.constraints.time_limit,
+            Some(Duration::from_millis(350))
         );
         session.handle_key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE));
-        assert_eq!(session.budget, initial);
+        assert_eq!(
+            session.constraints.time_limit,
+            Some(Duration::from_millis(300))
+        );
 
         session.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
         assert_eq!(session.frame_interval, Duration::from_millis(40));
@@ -2113,12 +2181,17 @@ mod tests {
 
     #[test]
     fn live_action_and_quit_keys_map_to_commands() {
+        let constraints = SearchConstraints {
+            simulation_limit: NonZeroUsize::new(512),
+            ..SearchConstraints::default()
+        };
         let mut session = LiveSession {
             terminal: LiveTerminal {
                 alternate_screen: false,
             },
-            budget: SearchBudget::Simulations(512),
-            last_limited_budget: SearchBudget::Simulations(512),
+            constraints,
+            saved_simulation_limit: constraints.simulation_limit,
+            saved_time_limit: constraints.time_limit,
             frame_interval: Duration::from_millis(50),
             notice: String::new(),
             revision: 0,
