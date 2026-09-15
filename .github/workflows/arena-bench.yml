@@ -80,12 +80,95 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 arena/scripts/bench_arena.py \
-            baseline/target/release/bayes-2048 \
-            arena/target/release/bayes-2048 \
-            arena-benchmark
+          BASE="$PWD/baseline/target/release/bayes-2048"
+          ARENA="$PWD/arena/target/release/bayes-2048"
+          OUT="$PWD/arena-benchmark"
+          mkdir -p "$OUT/runs"
+          echo 'budget,policy,seed,baseline_wall_ms,arena_wall_ms,speedup,baseline_sims_per_second,arena_sims_per_second,final_score,max_tile,moves,semantic_match' > "$OUT/pairs.csv"
+
+          run_one() {
+            local impl="$1" bin="$2" budget="$3" policy="$4" seed="$5"
+            local dir="$OUT/runs/${impl}-${policy}-b${budget}-s${seed}"
+            rm -rf "$dir"
+            mkdir -p "$dir"
+            "$bin" \
+              --games 1 \
+              --budgets "$budget" \
+              --policies "$policy" \
+              --seed "$seed" \
+              --out "$dir" \
+              --log-every 1 \
+              >/dev/null 2>&1
+            tail -n 1 "$dir/games.csv"
+          }
+
+          # Warm both code paths before recording timings.
+          run_one warm-baseline "$BASE" 64 uct 999 >/dev/null
+          run_one warm-arena "$ARENA" 64 uct 999 >/dev/null
+
+          mismatch=0
+          for budget in 128 512; do
+            for policy in uct exact-voc; do
+              for seed in 1 2 3 4; do
+                if (( seed % 2 == 0 )); then
+                  brow=$(run_one baseline "$BASE" "$budget" "$policy" "$seed")
+                  arow=$(run_one arena "$ARENA" "$budget" "$policy" "$seed")
+                else
+                  arow=$(run_one arena "$ARENA" "$budget" "$policy" "$seed")
+                  brow=$(run_one baseline "$BASE" "$budget" "$policy" "$seed")
+                fi
+
+                IFS=, read -r _ _ _ _ bscore btile bmoves bms bsps _ _ <<< "$brow"
+                IFS=, read -r _ _ _ _ ascore atile amoves ams asps _ _ <<< "$arow"
+
+                match=true
+                if [[ "$bscore" != "$ascore" || "$btile" != "$atile" || "$bmoves" != "$amoves" ]]; then
+                  match=false
+                  mismatch=1
+                fi
+                speedup=$(awk -v b="$bms" -v a="$ams" 'BEGIN { printf "%.9f", b/a }')
+                printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+                  "$budget" "$policy" "$seed" "$bms" "$ams" "$speedup" \
+                  "$bsps" "$asps" "$ascore" "$atile" "$amoves" "$match" \
+                  >> "$OUT/pairs.csv"
+                printf 'B=%3s %-9s seed=%s: %7.3fs -> %7.3fs  speedup=%6.3fx  match=%s\n' \
+                  "$budget" "$policy" "$seed" \
+                  "$(awk -v x="$bms" 'BEGIN{print x/1000}')" \
+                  "$(awk -v x="$ams" 'BEGIN{print x/1000}')" \
+                  "$speedup" "$match"
+              done
+            done
+          done
+
+          awk -F, '
+            BEGIN { print "budget,policy,n,baseline_total_s,arena_total_s,aggregate_speedup,mean_pair_speedup,all_semantic_match" }
+            NR > 1 {
+              key=$1 SUBSEP $2
+              n[key]++
+              b[key]+=$4
+              a[key]+=$5
+              sp[key]+=$6
+              if ($12 != "true") ok[key]=1
+            }
+            END {
+              for (key in n) {
+                split(key, p, SUBSEP)
+                printf "%s,%s,%d,%.9f,%.9f,%.9f,%.9f,%s\n", p[1], p[2], n[key], b[key]/1000, a[key]/1000, b[key]/a[key], sp[key]/n[key], (ok[key] ? "false" : "true")
+              }
+            }
+          ' "$OUT/pairs.csv" | sort -t, -k1,1n -k2,2 > "$OUT/summary.tmp"
+          head -n 1 "$OUT/summary.tmp" > "$OUT/summary.csv"
+          tail -n +2 "$OUT/summary.tmp" >> "$OUT/summary.csv"
+          rm "$OUT/summary.tmp"
+          cat "$OUT/summary.csv"
+
+          if (( mismatch != 0 )); then
+            echo 'ERROR: arena implementation changed deterministic game outcomes' >&2
+            exit 2
+          fi
 
       - name: Upload benchmark results
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: bayes-2048-arena-benchmark
