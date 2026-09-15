@@ -44,6 +44,15 @@ impl fmt::Display for Dir {
     }
 }
 
+fn dir_symbol(dir: Dir) -> char {
+    match dir {
+        Dir::Up => '↑',
+        Dir::Down => '↓',
+        Dir::Left => '←',
+        Dir::Right => '→',
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Board([u8; 16]); // exponent: 0=empty, 1=2, 2=4, ...
 
@@ -858,6 +867,31 @@ impl SearchConstraints {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConstraintKind {
+    Simulations,
+    Time,
+    Voc,
+}
+
+impl ConstraintKind {
+    fn next(self) -> Self {
+        match self {
+            Self::Simulations => Self::Time,
+            Self::Time => Self::Voc,
+            Self::Voc => Self::Simulations,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Simulations => "simulations",
+            Self::Time => "time",
+            Self::Voc => "VOC",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct LiveSearch {
     move_index: usize,
@@ -929,8 +963,10 @@ impl Drop for LiveTerminal {
 struct LiveSession {
     terminal: LiveTerminal,
     constraints: SearchConstraints,
-    saved_simulation_limit: Option<NonZeroUsize>,
-    saved_time_limit: Option<Duration>,
+    selected_constraint: ConstraintKind,
+    saved_simulation_limit: NonZeroUsize,
+    saved_time_limit: Duration,
+    saved_min_voc: f64,
     frame_interval: Duration,
     notice: String,
     revision: u64,
@@ -940,6 +976,11 @@ impl LiveSession {
     const TIME_STEP: Duration = Duration::from_millis(50);
     const MIN_TIME: Duration = Duration::from_millis(10);
     const SIMULATION_STEP: usize = 128;
+    const DEFAULT_SIMULATION_LIMIT: NonZeroUsize = NonZeroUsize::new(512).unwrap();
+    const DEFAULT_TIME_LIMIT: Duration = Duration::from_millis(300);
+    const DEFAULT_MIN_VOC: f64 = 1.0;
+    const VOC_ZERO_NUDGE: f64 = 0.001;
+    const VOC_FACTOR: f64 = 10.0;
     const FRAME_STEP: Duration = Duration::from_millis(10);
     const MIN_FRAME: Duration = Duration::from_millis(10);
 
@@ -947,8 +988,12 @@ impl LiveSession {
         Ok(Self {
             terminal: LiveTerminal::enter()?,
             constraints,
-            saved_simulation_limit: constraints.simulation_limit,
-            saved_time_limit: constraints.time_limit,
+            selected_constraint: ConstraintKind::Simulations,
+            saved_simulation_limit: constraints
+                .simulation_limit
+                .unwrap_or(Self::DEFAULT_SIMULATION_LIMIT),
+            saved_time_limit: constraints.time_limit.unwrap_or(Self::DEFAULT_TIME_LIMIT),
+            saved_min_voc: constraints.min_voc.unwrap_or(Self::DEFAULT_MIN_VOC),
             frame_interval,
             notice: "searching".into(),
             revision: 0,
@@ -964,45 +1009,146 @@ impl LiveSession {
         self.revision = self.revision.wrapping_add(1);
     }
 
-    fn toggle_resource_limits(&mut self) {
-        if self.constraints.hard_limits_disabled() {
-            self.constraints.simulation_limit = self
-                .saved_simulation_limit
-                .or_else(|| NonZeroUsize::new(512));
-            self.constraints.time_limit = self.saved_time_limit;
-            self.set_notice(format!("restored {}", self.constraints.describe()));
-        } else {
-            self.saved_simulation_limit = self.constraints.simulation_limit;
-            self.saved_time_limit = self.constraints.time_limit;
-            self.constraints.simulation_limit = None;
-            self.constraints.time_limit = None;
-            self.set_notice("resource caps disabled; other stop constraints remain active");
+    fn select_constraint(&mut self, selected: ConstraintKind) {
+        self.selected_constraint = selected;
+        self.set_notice(format!("selected {} constraint", selected.name()));
+    }
+
+    fn toggle_selected_constraint(&mut self) {
+        match self.selected_constraint {
+            ConstraintKind::Simulations => {
+                if let Some(value) = self.constraints.simulation_limit {
+                    self.saved_simulation_limit = value;
+                    self.constraints.simulation_limit = None;
+                    self.set_notice("simulation constraint disabled");
+                } else {
+                    self.constraints.simulation_limit = Some(self.saved_simulation_limit);
+                    self.set_notice(format!(
+                        "simulation constraint restored to {}",
+                        self.saved_simulation_limit
+                    ));
+                }
+            }
+            ConstraintKind::Time => {
+                if let Some(value) = self.constraints.time_limit {
+                    self.saved_time_limit = value;
+                    self.constraints.time_limit = None;
+                    self.set_notice("time constraint disabled");
+                } else {
+                    self.constraints.time_limit = Some(self.saved_time_limit);
+                    self.set_notice(format!(
+                        "time constraint restored to {:.0} ms",
+                        self.saved_time_limit.as_secs_f64() * 1000.0
+                    ));
+                }
+            }
+            ConstraintKind::Voc => {
+                if let Some(value) = self.constraints.min_voc {
+                    self.saved_min_voc = value;
+                    self.constraints.min_voc = None;
+                    self.set_notice("VOC constraint disabled");
+                } else {
+                    self.constraints.min_voc = Some(self.saved_min_voc);
+                    self.set_notice(format!(
+                        "VOC constraint restored to {:.4}",
+                        self.saved_min_voc
+                    ));
+                }
+            }
         }
     }
 
-    fn adjust_resource_limit(&mut self, increase: bool) {
-        if let Some(duration) = self.constraints.time_limit {
-            let adjusted = if increase {
-                duration.saturating_add(Self::TIME_STEP)
-            } else {
-                duration.saturating_sub(Self::TIME_STEP).max(Self::MIN_TIME)
-            };
-            self.constraints.time_limit = Some(adjusted);
-            self.saved_time_limit = Some(adjusted);
-        } else {
-            let current = self
-                .constraints
-                .simulation_limit
-                .map_or(512, NonZeroUsize::get);
-            let adjusted = if increase {
-                current.saturating_add(Self::SIMULATION_STEP)
-            } else {
-                current.saturating_sub(Self::SIMULATION_STEP).max(1)
-            };
-            self.constraints.simulation_limit = NonZeroUsize::new(adjusted);
-            self.saved_simulation_limit = self.constraints.simulation_limit;
+    fn adjust_selected_constraint(&mut self, increase: bool) {
+        match self.selected_constraint {
+            ConstraintKind::Simulations => {
+                let current = self
+                    .constraints
+                    .simulation_limit
+                    .unwrap_or(self.saved_simulation_limit)
+                    .get();
+                let adjusted = if increase {
+                    current.saturating_add(Self::SIMULATION_STEP)
+                } else {
+                    current.saturating_sub(Self::SIMULATION_STEP).max(1)
+                };
+                self.saved_simulation_limit = NonZeroUsize::new(adjusted).unwrap();
+                if self.constraints.simulation_limit.is_some() {
+                    self.constraints.simulation_limit = Some(self.saved_simulation_limit);
+                }
+                self.set_notice(format!(
+                    "simulation {} = {}{}",
+                    if self.constraints.simulation_limit.is_some() {
+                        "limit"
+                    } else {
+                        "saved value"
+                    },
+                    adjusted,
+                    if self.constraints.simulation_limit.is_some() {
+                        ""
+                    } else {
+                        " (off)"
+                    },
+                ));
+            }
+            ConstraintKind::Time => {
+                let current = self.constraints.time_limit.unwrap_or(self.saved_time_limit);
+                let adjusted = if increase {
+                    current.saturating_add(Self::TIME_STEP)
+                } else {
+                    current.saturating_sub(Self::TIME_STEP).max(Self::MIN_TIME)
+                };
+                self.saved_time_limit = adjusted;
+                if self.constraints.time_limit.is_some() {
+                    self.constraints.time_limit = Some(adjusted);
+                }
+                self.set_notice(format!(
+                    "time {} = {:.0} ms{}",
+                    if self.constraints.time_limit.is_some() {
+                        "limit"
+                    } else {
+                        "saved value"
+                    },
+                    adjusted.as_secs_f64() * 1000.0,
+                    if self.constraints.time_limit.is_some() {
+                        ""
+                    } else {
+                        " (off)"
+                    },
+                ));
+            }
+            ConstraintKind::Voc => {
+                let current = self.constraints.min_voc.unwrap_or(self.saved_min_voc);
+                let adjusted = if increase {
+                    if current == 0.0 {
+                        Self::VOC_ZERO_NUDGE
+                    } else {
+                        current * Self::VOC_FACTOR
+                    }
+                } else if current <= Self::VOC_ZERO_NUDGE {
+                    0.0
+                } else {
+                    current / Self::VOC_FACTOR
+                };
+                self.saved_min_voc = adjusted;
+                if self.constraints.min_voc.is_some() {
+                    self.constraints.min_voc = Some(adjusted);
+                }
+                self.set_notice(format!(
+                    "VOC {} = {:.4}{}",
+                    if self.constraints.min_voc.is_some() {
+                        "threshold"
+                    } else {
+                        "saved value"
+                    },
+                    adjusted,
+                    if self.constraints.min_voc.is_some() {
+                        ""
+                    } else {
+                        " (off)"
+                    },
+                ));
+            }
         }
-        self.set_notice(format!("constraints {}", self.constraints.describe()));
     }
 
     fn adjust_frame_interval(&mut self, increase: bool) {
@@ -1037,16 +1183,32 @@ impl LiveSession {
             KeyCode::Down => LiveCommand::Force(Dir::Down),
             KeyCode::Left => LiveCommand::Force(Dir::Left),
             KeyCode::Right => LiveCommand::Force(Dir::Right),
-            KeyCode::Char('i') => {
-                self.toggle_resource_limits();
+            KeyCode::Char('1') | KeyCode::Char('s') => {
+                self.select_constraint(ConstraintKind::Simulations);
+                LiveCommand::Continue
+            }
+            KeyCode::Char('2') | KeyCode::Char('t') => {
+                self.select_constraint(ConstraintKind::Time);
+                LiveCommand::Continue
+            }
+            KeyCode::Char('3') | KeyCode::Char('v') => {
+                self.select_constraint(ConstraintKind::Voc);
+                LiveCommand::Continue
+            }
+            KeyCode::Tab => {
+                self.select_constraint(self.selected_constraint.next());
+                LiveCommand::Continue
+            }
+            KeyCode::Char('x') => {
+                self.toggle_selected_constraint();
                 LiveCommand::Continue
             }
             KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::PageUp => {
-                self.adjust_resource_limit(true);
+                self.adjust_selected_constraint(true);
                 LiveCommand::Continue
             }
             KeyCode::Char('-') | KeyCode::PageDown => {
-                self.adjust_resource_limit(false);
+                self.adjust_selected_constraint(false);
                 LiveCommand::Continue
             }
             KeyCode::Char('[') => {
@@ -1131,59 +1293,92 @@ fn render_search_frame(
     )
     .expect("writing to String cannot fail");
 
-    let hard_fraction = [
-        session
-            .constraints
-            .simulation_limit
-            .map(|limit| snapshot.total_samples as f64 / limit.get() as f64),
-        session
-            .constraints
-            .time_limit
-            .map(|limit| compute_elapsed.as_secs_f64() / limit.as_secs_f64()),
-    ]
-    .into_iter()
-    .flatten()
-    .fold(None::<f64>, |acc, x| Some(acc.map_or(x, |a| a.max(x))));
+    writeln!(
+        output,
+        "think {:>8.1} ms | {:>7} sims | {:>8.0} sims/s",
+        compute_seconds * 1000.0,
+        snapshot.total_samples,
+        sims_per_second,
+    )
+    .expect("writing to String cannot fail");
+    writeln!(
+        output,
+        "constraints (first enabled condition to trip stops search):"
+    )
+    .expect("writing to String cannot fail");
 
-    if let Some(fraction) = hard_fraction {
+    let sim_mark = if session.selected_constraint == ConstraintKind::Simulations {
+        '>'
+    } else {
+        ' '
+    };
+    if let Some(limit) = session.constraints.simulation_limit {
+        let fraction = snapshot.total_samples as f64 / limit.get() as f64;
         writeln!(
             output,
-            "think {:>8.1} ms | {:>7} sims [{}] {:>3.0}% | {:>8.0} sims/s",
-            compute_seconds * 1000.0,
+            "{sim_mark} 1 sims  {:>7} / {:<7} [{}] {:>3.0}%",
             snapshot.total_samples,
+            limit.get(),
             progress_bar(fraction),
             100.0 * fraction.clamp(0.0, 1.0),
-            sims_per_second,
         )
         .expect("writing to String cannot fail");
     } else {
         writeln!(
             output,
-            "think {:>8.1} ms | {:>7} sims [   no resource cap    ] | {:>8.0} sims/s",
-            compute_seconds * 1000.0,
-            snapshot.total_samples,
-            sims_per_second,
+            "{sim_mark} 1 sims  off | current {:>7} | saved {}",
+            snapshot.total_samples, session.saved_simulation_limit,
         )
         .expect("writing to String cannot fail");
     }
 
-    let sim_limit = session
-        .constraints
-        .simulation_limit
-        .map_or_else(|| "off".into(), |n| n.get().to_string());
-    let time_limit = session.constraints.time_limit.map_or_else(
-        || "off".into(),
-        |d| format!("{:.1} ms", d.as_secs_f64() * 1000.0),
-    );
-    let voc_limit = session
-        .constraints
-        .min_voc
-        .map_or_else(|| "off".into(), |v| format!("{v:.4}"));
-    writeln!(
-        output,
-        "limits sims {sim_limit} | time {time_limit} | min VOC {voc_limit}"
-    )
-    .expect("writing to String cannot fail");
+    let time_mark = if session.selected_constraint == ConstraintKind::Time {
+        '>'
+    } else {
+        ' '
+    };
+    if let Some(limit) = session.constraints.time_limit {
+        let fraction = compute_elapsed.as_secs_f64() / limit.as_secs_f64();
+        writeln!(
+            output,
+            "{time_mark} 2 time  {:>7.1} / {:<7.1} ms [{}] {:>3.0}%",
+            compute_seconds * 1000.0,
+            limit.as_secs_f64() * 1000.0,
+            progress_bar(fraction),
+            100.0 * fraction.clamp(0.0, 1.0),
+        )
+        .expect("writing to String cannot fail");
+    } else {
+        writeln!(
+            output,
+            "{time_mark} 2 time  off | current {:>7.1} ms | saved {:.1} ms",
+            compute_seconds * 1000.0,
+            session.saved_time_limit.as_secs_f64() * 1000.0,
+        )
+        .expect("writing to String cannot fail");
+    }
+
+    let voc_mark = if session.selected_constraint == ConstraintKind::Voc {
+        '>'
+    } else {
+        ' '
+    };
+    if let Some(min_voc) = session.constraints.min_voc {
+        let relation = if max_voc <= min_voc { "STOP" } else { "keep" };
+        writeln!(
+            output,
+            "{voc_mark} 3 VOC   {:>9.4} > {:<9.4} [{relation}]",
+            max_voc, min_voc,
+        )
+        .expect("writing to String cannot fail");
+    } else {
+        writeln!(
+            output,
+            "{voc_mark} 3 VOC   off | current {:>9.4} | saved {:.4}",
+            max_voc, session.saved_min_voc,
+        )
+        .expect("writing to String cannot fail");
+    }
 
     writeln!(
         output,
@@ -1217,7 +1412,7 @@ fn render_search_frame(
     .expect("writing to String cannot fail");
     for dir in DIRS {
         let mark = if snapshot.best_dir == dir { '*' } else { ' ' };
-        write!(output, " {mark} {dir:<2}|").expect("writing to String cannot fail");
+        write!(output, " {mark} {:<2}|", dir_symbol(dir)).expect("writing to String cannot fail");
         if let Some(action) = snapshot.action(dir) {
             writeln!(
                 output,
@@ -1247,7 +1442,7 @@ fn render_search_frame(
     .expect("writing to String cannot fail");
     writeln!(
         output,
-        "keys: space/enter act | arrows force | +/- resource cap | i toggle resource caps | [/] refresh | q quit"
+        "keys: 1/s sims  2/t time  3/v VOC  tab cycle | x toggle | +/- adjust | space/enter act | arrows force | [/] refresh | q quit"
     )
     .expect("writing to String cannot fail");
 
@@ -2094,7 +2289,10 @@ mod tests {
 
     #[test]
     fn direction_symbols_have_fixed_width_labels() {
-        let labels: Vec<String> = DIRS.into_iter().map(|dir| format!("  {dir:<2}|")).collect();
+        let labels: Vec<String> = DIRS
+            .into_iter()
+            .map(|dir| format!("  {:<2}|", dir_symbol(dir)))
+            .collect();
 
         assert_eq!(labels, ["  ↑ |", "  ↓ |", "  ← |", "  → |"]);
         assert!(labels.iter().all(|label| label.chars().count() == 5));
@@ -2135,7 +2333,7 @@ mod tests {
     }
 
     #[test]
-    fn live_resource_constraints_toggle_and_adjust() {
+    fn live_constraints_select_toggle_and_adjust_independently() {
         let initial = SearchConstraints {
             simulation_limit: NonZeroUsize::new(512),
             time_limit: Some(Duration::from_millis(300)),
@@ -2146,32 +2344,63 @@ mod tests {
                 alternate_screen: false,
             },
             constraints: initial,
-            saved_simulation_limit: initial.simulation_limit,
-            saved_time_limit: initial.time_limit,
+            selected_constraint: ConstraintKind::Simulations,
+            saved_simulation_limit: NonZeroUsize::new(512).unwrap(),
+            saved_time_limit: Duration::from_millis(300),
+            saved_min_voc: 1.0,
             frame_interval: Duration::from_millis(50),
             notice: String::new(),
             revision: 0,
         };
 
+        // Time can be cleared without touching simulations or VOC.
+        session.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(session.selected_constraint, ConstraintKind::Time);
+        session.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(session.constraints.time_limit, None);
         assert_eq!(
-            session.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),
-            LiveCommand::Continue
+            session.constraints.simulation_limit,
+            initial.simulation_limit
         );
-        assert!(session.constraints.hard_limits_disabled());
-        assert_eq!(session.constraints.min_voc, Some(1.0));
+        assert_eq!(session.constraints.min_voc, initial.min_voc);
 
-        session.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
-        assert_eq!(session.constraints, initial);
+        // Adjusting a disabled constraint edits its remembered value but does
+        // not silently enable it; toggling restores the edited value.
         session.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+        assert_eq!(session.constraints.time_limit, None);
+        assert_eq!(session.saved_time_limit, Duration::from_millis(350));
+        session.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         assert_eq!(
             session.constraints.time_limit,
             Some(Duration::from_millis(350))
         );
+
+        // VOC uses logarithmic decade steps: 1 -> 0.1 -> 1.
+        session.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
         session.handle_key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE));
+        assert_eq!(session.constraints.min_voc, Some(0.1));
+        session.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+        assert_eq!(session.constraints.min_voc, Some(1.0));
+        session.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(session.constraints.min_voc, None);
+        assert_eq!(
+            session.constraints.simulation_limit,
+            initial.simulation_limit
+        );
         assert_eq!(
             session.constraints.time_limit,
-            Some(Duration::from_millis(300))
+            Some(Duration::from_millis(350))
         );
+
+        // Simulation limit is independently selectable and restorable too.
+        session.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        session.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(session.constraints.simulation_limit, None);
+        session.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+        assert_eq!(session.saved_simulation_limit.get(), 640);
+        assert_eq!(session.constraints.simulation_limit, None);
+        session.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(session.constraints.simulation_limit.unwrap().get(), 640);
 
         session.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
         assert_eq!(session.frame_interval, Duration::from_millis(40));
@@ -2190,8 +2419,10 @@ mod tests {
                 alternate_screen: false,
             },
             constraints,
-            saved_simulation_limit: constraints.simulation_limit,
-            saved_time_limit: constraints.time_limit,
+            selected_constraint: ConstraintKind::Simulations,
+            saved_simulation_limit: NonZeroUsize::new(512).unwrap(),
+            saved_time_limit: Duration::from_millis(300),
+            saved_min_voc: 1.0,
             frame_interval: Duration::from_millis(50),
             notice: String::new(),
             revision: 0,
